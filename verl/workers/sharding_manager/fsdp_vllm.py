@@ -14,11 +14,14 @@
 
 import os
 import logging
+from typing import Union
 import torch
 import numpy as np
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType, FullStateDictConfig
 from torch.distributed.device_mesh import DeviceMesh
+from vllm import AsyncLLMEngine
+
 
 from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
@@ -93,7 +96,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             self.inference_engine.wake_up()
             world_size = torch.distributed.get_world_size()
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            try:
+                model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            except:
+                model = self.inference_engine.engine.model_executor.driver_worker.worker.model_runner.model
             loaded_params = model.load_weights(
                 ((name, param.full_tensor() if world_size != 1 else param) for name, param in params.items()))
             logger.info(f"vLLM load wegiths, loaded_params: {len(loaded_params)}")
@@ -143,6 +149,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             return data
 
         # TODO: Current impl doesn't consider FSDP with torch micro-dp
+        tp_size = vllm_ps.get_tensor_model_parallel_world_size()
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3'):
             group = vllm_ps.get_tensor_model_parallel_group()
         else:

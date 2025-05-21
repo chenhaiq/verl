@@ -38,7 +38,7 @@ install_requires = [
   'tensordict<0.6',
   'torchdata',
   'transformers',
-  'vllm<=0.6.3',
+  'vllm @ git+https://github.com/vllm-project/vllm.git@54ed913f3437f9107791e8ea410170b86c968d52#egg=vllm',
   'wandb',
 ]
 

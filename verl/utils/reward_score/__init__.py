@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
-
+from rllm.rewards.rl_reward import rllm_reward_fn
+# from rllm.rewards.code_reward import rllm_code_reward_fn
+import json 
 
 def _default_compute_score(data_source, solution_str, ground_truth, extra_info=None):
     if data_source == 'openai/gsm8k':
@@ -38,7 +40,7 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
     else:
-        raise NotImplementedError
+        return rllm_reward_fn(data_source, solution_str, ground_truth, extra_info)
 
     if isinstance(res, (int, float, bool)):
         return float(res)

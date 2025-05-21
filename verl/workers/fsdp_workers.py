@@ -17,17 +17,19 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import ray
 import warnings
 import psutil
 
 import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import register, Dispatch
+from verl.single_controller.base.decorator import register, Dispatch, Execute
 from verl.utils import hf_tokenizer, hf_processor
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_to_local
@@ -66,14 +68,13 @@ def get_sharding_strategy(device_mesh):
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
 
-
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str):
+    def __init__(self, config: DictConfig, role: str, reward_config: DictConfig = None):
         super().__init__()
         self.config = config
         import torch.distributed
@@ -95,6 +96,7 @@ class ActorRolloutRefWorker(Worker):
                                                         mesh_dim_names=['dp', 'sp'])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        self.reward_config = reward_config
 
         self.role = role
         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
@@ -154,7 +156,7 @@ class ActorRolloutRefWorker(Worker):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
 
-        assert role in ['actor', 'ref']
+        assert role in ['actor', 'ref', 'rollout']
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
         local_path = copy_to_local(model_path)
@@ -302,6 +304,22 @@ class ActorRolloutRefWorker(Worker):
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
         rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
+
+        self.reward_fn = None
+        self.val_reward_fn = None
+        if self.reward_config is not None and self.config.rollout.compute_reward:
+            reward_manager_name = self.reward_config.get("reward_manager", "naive")
+            if reward_manager_name == 'naive':
+                from verl.workers.reward_manager import NaiveRewardManager
+                reward_manager_cls = NaiveRewardManager
+            elif reward_manager_name == 'prime':
+                from verl.workers.reward_manager import PrimeRewardManager
+                reward_manager_cls = PrimeRewardManager
+            else:
+                raise NotImplementedError
+            self.reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=0)
+            self.val_reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=1)
+        
         rollout_name = self.config.rollout.name
         if rollout_name == 'hf':
             from verl.workers.rollout import HFRollout
@@ -316,6 +334,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
             if vllm_mode == 'customized':
+                assert self.config.rollout.compute_reward is False, "Reward computation is not supported for customized vLLM rollout."
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
@@ -325,6 +344,8 @@ class ActorRolloutRefWorker(Worker):
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
                                       model_hf_config=self.actor_model_config,
+                                      reward_fn=self.reward_fn,
+                                      val_reward_fn=self.val_reward_fn,
                                       device_mesh=rollout_device_mesh)
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
@@ -350,7 +371,9 @@ class ActorRolloutRefWorker(Worker):
             rollout = SGLangRollout(actor_module=self.config.model.path,
                                     config=self.config.rollout,
                                     tokenizer=self.tokenizer,
-                                    model_hf_config=self.actor_model_config)
+                                    model_hf_config=self.actor_model_config,
+                                    reward_fn=self.reward_fn,
+                                    val_reward_fn=self.val_reward_fn)
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
 
             if torch.distributed.get_world_size() == 1:
@@ -380,9 +403,11 @@ class ActorRolloutRefWorker(Worker):
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
+                role = 'actor'
             else:
                 optim_config = None
-                fsdp_config = OmegaConf.create()
+                fsdp_config = self.config.actor.fsdp_config
+                role = 'rollout'
             self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler, self.actor_model_config = self._build_model_optimizer(
                 model_path=self.config.model.path,
                 fsdp_config=fsdp_config,
@@ -392,7 +417,7 @@ class ActorRolloutRefWorker(Worker):
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
                 trust_remote_code=self.config.model.get('trust_remote_code', False),
                 use_liger=self.config.model.get('use_liger', False),
-                role='actor')
+                role=role)
 
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
@@ -481,6 +506,95 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=True)
+    def update_actor_mini_batch(self, data: DataProto):
+        data = data.to('cuda')
+
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+
+        data.batch = data.batch.cuda()
+        log_gpu_memory_usage('Before update policy', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # perform training
+            with Timer(name='update_policy', logger=None) as timer:
+                metrics = self.actor.update_policy_mini_batch(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info['global_token_num']
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+
+            if data.meta_info.get("last_mini_batch", False):
+                self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/lr'] = lr
+
+            log_gpu_memory_usage('After update policy', logger=logger)
+
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={'metrics': metrics})
+
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        torch.cuda.empty_cache()
+        return output
+
+
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=True)
+    def update_actor_micro_batch(self, data: DataProto):
+        data = data.to('cuda')
+
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+
+        data.batch = data.batch.cuda()
+        log_gpu_memory_usage('Before update policy', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # perform training
+            with Timer(name='update_policy', logger=None) as timer:
+                metrics = self.actor.update_policy_micro_batch(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info['global_token_num']
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+
+            if data.meta_info.get("last_mini_batch", False):
+                self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/lr'] = lr
+
+            log_gpu_memory_usage('After update policy', logger=logger)
+
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={'metrics': metrics})
+
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        torch.cuda.empty_cache()
+        return output
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
@@ -520,6 +634,70 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
+
+    @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
+    def generate_sequences_async(self, prompts: DataProto = None, **kwargs):
+        """Generator function that yields outputs as they complete.
+        
+        Args:
+            prompts: DataProto containing the input prompts
+            **kwargs: Additional arguments to modify sampling parameters
+            
+        Yields:
+            DataProto: Generated sequence outputs as they complete
+        """
+        assert self._is_rollout, "generate_sequences_async requires rollout capability"
+        assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
+        
+        if not hasattr(self, '_generator'):
+            self._generator = None
+        
+        if prompts is None and self._generator is None:
+            return None
+        
+        if self._generator is None:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+            prompts = prompts.to(torch.cuda.current_device())
+            meta_info = {
+                'eos_token_id':
+                    self.generation_config.eos_token_id
+                    if self.generation_config is not None else self.tokenizer.eos_token_id,
+                'pad_token_id':
+                    self.generation_config.pad_token_id
+                    if self.generation_config is not None else self.tokenizer.pad_token_id,
+            }
+            prompts.meta_info.update(meta_info)
+            self.rollout_sharding_manager.__enter__()
+            
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+            
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
+            return None
+        try:
+            output = next(self._generator)
+            if output is None:
+                raise StopIteration
+            output = self.rollout_sharding_manager.postprocess_data(output)
+            return output.to('cpu')
+        except StopIteration:
+            self._generator = None
+            self.rollout_sharding_manager.__exit__(None, None, None)
+            torch.cuda.empty_cache()
+            log_gpu_memory_usage('After generate sequences', logger=logger)
+            return None
+        except Exception as e:
+            print(e)
+            self.rollout_sharding_manager.__exit__(None, None, None)
+            return None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
@@ -582,6 +760,80 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def get_state_dict(self):
+        """Return the state dict of the FSDP-wrapped module with tensors moved to CPU."""
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+            new_state_dict = self.actor_module_fsdp.state_dict()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return ray.put(new_state_dict)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_rollout_actor_module(self, new_state_dict_ref):
+        """
+        Update the rollout worker’s actor_module_fsdp with the new FSDP-wrapped actor module.
+        This function handles the case where the new module is on a different GPU and may have a 
+        different dtype. We extract a full state dict from the new module (offloaded to CPU),
+        convert it to the local module's expected dtype, load it into our local actor_module_fsdp,
+        and then recreate the rollout instance to use the updated module.
+        
+        Args:
+            new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
+        """
+        # Temp bandaid to kill zombie processes from coding.
+        try:
+            os.system('pkill -f "python3 /var/tmp/"')
+        except Exception as e:
+            pass
+        new_state_dict = ray.get(new_state_dict_ref)
+        # Ensure we are in a rollout role.
+        if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
+            raise ValueError("update_rollout_actor_module should only be called on a rollout worker.")
+
+        local_dtype = None
+        for p in self.actor_module_fsdp.parameters():
+            local_dtype = p.dtype
+            break
+        if local_dtype is None:
+            raise ValueError("Unable to determine the dtype of the local actor_module_fsdp.")
+
+        # Convert each tensor in the state dict to the correct dtype and device
+        new_state_dict = {
+            k: v.to(dtype=local_dtype)
+            for k, v in new_state_dict.items()
+        }
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # Load the new state dict into our local actor_module_fsdp.
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+            self.actor_module_fsdp.load_state_dict(new_state_dict)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        # Update our reference to the underlying (unwrapped) module.
+        self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+
+        # Recreate the rollout instance (and its sharding manager) so that it uses the updated module.
+        # self.rollout, self.rollout_sharding_manager = self._build_rollout()
+        # TODO: we might not need this, double check
+        # with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+        #     self.rollout_sharding_manager.module.load_state_dict(new_state_dict)
+        logger.info("Updated local actor_module_fsdp from new module and recreated rollout instance.")
+
+        del new_state_dict
+        # Optionally, clear CUDA cache.
+        torch.cuda.empty_cache()
+
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
         # only support save and load ckpt for actor
@@ -594,6 +846,26 @@ class ActorRolloutRefWorker(Worker):
                                                 hdfs_path=hdfs_path,
                                                 global_step=global_step,
                                                 remove_previous_ckpt=remove_previous_ckpt)
+        
+        torch.distributed.barrier()
+
+        # TODO: support DCP and save sharded checkpoints
+        import torch.distributed
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.actor.actor_module.state_dict()
+        if self.rank == 0:
+            full_checkpoint_local_path=f'{local_path}/checkpoint'
+            print(f'Saving actor checkpoint to {full_checkpoint_local_path}')
+            os.makedirs(full_checkpoint_local_path, exist_ok=True)
+            self.actor_module.save_pretrained(full_checkpoint_local_path, state_dict=state_dict)
+            self.tokenizer.save_pretrained(full_checkpoint_local_path)
+            if hdfs_path is not None:
+                print(f'Uploading actor checkpoint to {hdfs_path}')
+                hdfs_io.makedirs(hdfs_path, exist_ok=True)
+                hdfs_io.copy(src=full_checkpoint_local_path, dst=hdfs_path)
+
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -876,6 +1148,7 @@ class CriticWorker(Worker):
                                                 remove_previous_ckpt=remove_previous_ckpt)
 
         torch.distributed.barrier()
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
 
@@ -1001,7 +1274,7 @@ class RewardModelWorker(Worker):
         self.reward_module = self._build_model(config=self.config)
 
     def _forward_micro_batch(self, micro_batch):
-        from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
+        from verl.models.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
         from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):

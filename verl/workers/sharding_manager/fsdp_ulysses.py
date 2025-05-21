@@ -53,6 +53,7 @@ class FSDPUlyssesShardingManager(BaseShardingManager):
             # revert to previous sp group
             set_ulysses_sequence_parallel_group(self.prev_sp_group)
             # TODO: check how to set seed for each model
+        torch.cuda.empty_cache()
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         """

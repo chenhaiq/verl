@@ -14,10 +14,13 @@
 """
 Generate responses given a dataset of prompts
 """
+import csv
 import ray
+import json
 import numpy as np
 import hydra
 import os
+from tabulate import tabulate
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -28,12 +31,38 @@ from verl.utils.model import compute_position_id_with_mask
 import pandas as pd
 
 from transformers import AutoTokenizer
+import wandb
+
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
+from verl.protocol import (
+    DataProtoItem,
+    pad_dataproto_to_divisor,
+    unpad_dataproto,
+)
+from verl.single_controller.ray import (
+    RayClassWithInitArgs,
+    RayResourcePool,
+    RayWorkerGroup,
+)
+from verl.trainer.ppo.ray_trainer import dataprotoitem_to_dataproto
+from verl.utils import hf_tokenizer
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.fs import copy_to_local
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.hdfs_io import makedirs
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.reward_manager import NaiveRewardManager
+
+# Add the select_reward_fn from main_eval.py
+def select_reward_fn(data_source):
+    if data_source == 'lighteval/MATH':
+        from verl.utils.reward_score import math
+        return math.compute_score
+    else:
+        from rllm.rewards.rl_reward import rllm_reward_fn
+        reward_fn = lambda s, gt: rllm_reward_fn(data_source, s, gt)
+        return reward_fn
 
 
 @hydra.main(config_path='config', config_name='generation', version_base=None)
@@ -56,99 +85,139 @@ def main_task(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+
+    wandb.init(project='verl')
+    run_generation(config)
+
+
+def run_generation(config):
+    assert config.rollout.compute_reward is False, 'compute_reward must be False for generation'
+    assert config.rollout.enable_log_prob is False, 'enable_log_prob must be False for generation'
+    assert config.rollout.async_engine is False, 'async_engine must be False for generation'
+    
+    
+    
     local_path = copy_to_local(config.model.path)
-    from verl.utils import hf_tokenizer
+    
+
     tokenizer = hf_tokenizer(local_path)
-
     if config.rollout.temperature == 0.:
-        assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
+        assert config.rollout.n_val == 1, 'When temperature=0, n_val must be 1.'
 
-    # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
-    dataset = pd.read_parquet(config.data.path)
-    chat_lst = dataset[config.data.prompt_key].tolist()
+    # Load Dataset
+    try:
+        dataset = pd.read_parquet(config.data.path)
+    except Exception as e:
+        config.data.path = config.data.path.replace('.parquet', '.json')
+        print(f"Error loading dataset: {e}")
+        dataset = pd.read_json(config.data.path)
+        
+        
 
-    chat_lst = [chat.tolist() for chat in chat_lst]
-
-    tokenizer.padding_side = 'left'
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role='rollout')
+    val_dataset = RLHFDataset(parquet_files=config.data.path,
+        tokenizer=tokenizer,
+        prompt_key=config.data.prompt_key,
+        image_key=config.data.get('image_key', 'images'),
+        max_prompt_length=config.rollout.prompt_length,
+        filter_prompts=True,
+        return_raw_chat=config.data.get('return_raw_chat', False),
+        truncation=config.data.get('truncation', 'error'),
+        filter_overlong_prompts=config.data.filter_overlong_prompts)
+    val_dataloader = StatefulDataLoader(
+        dataset=val_dataset,
+        batch_size=len(val_dataset),
+        num_workers=8,
+        shuffle=False,
+        collate_fn=collate_fn)
+    
+    # Load Rollout Workers
     resource_pool = RayResourcePool(process_on_nodes=[config.trainer.n_gpus_per_node] * config.trainer.nnodes)
-    wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
-    wg.init_model()
+    ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role='actor_rollout')
+    rollout_wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
+    rollout_wg.init_model()
+    
+    for test_data in val_dataloader:
+        test_batch = DataProto.from_single_dict(test_data)
+        n_val = config.rollout.n_val
+        test_batch = test_batch.repeat(repeat_times=n_val, interleave=True)
+        
+        # Store original inputs
+        test_batch.meta_info = {
+            'eos_token_id': tokenizer.eos_token_id,
+            'pad_token_id': tokenizer.pad_token_id,
+            'recompute_log_prob': False,
+            'do_sample': False,
+            'validate': True,
+        }
+        test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, rollout_wg.world_size)
+        test_output_gen_batch_padded = rollout_wg.generate_sequences(test_batch_padded)
+        test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)    
+    
+    output_ids = test_output_gen_batch_padded.batch['responses']
+    output_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+    test_batch = dataprotoitem_to_dataproto(test_output_gen_batch) #test_batch.union(test_output_gen_batch)
 
-    total_samples = len(dataset)
-    # real_batch_size = data.batch['input_ids'].shape[0]
-    config_batch_size = config.data.batch_size
-    dispatch_dp_size = wg.world_size
-    num_batch = -(-total_samples // config_batch_size)
-    output_lst = [[] for _ in range(config.data.n_samples)]
-
-    for batch_idx in range(num_batch):
-        print(f'[{batch_idx+1}/{num_batch}] Start to process.')
-        batch_chat_lst = chat_lst[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
-        inputs = tokenizer.apply_chat_template(batch_chat_lst,
-                                               add_generation_prompt=True,
-                                               padding=True,
-                                               truncation=True,
-                                               max_length=config.rollout.prompt_length,
-                                               return_tensors='pt',
-                                               return_dict=True,
-                                               tokenize=True)
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        position_ids = compute_position_id_with_mask(attention_mask)
-
-        batch_dict = {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids}
-
-        data = DataProto.from_dict(batch_dict)
-        real_batch_size = data.batch['input_ids'].shape[0]
-        if real_batch_size % dispatch_dp_size != 0:
-            dummy_data_size = dispatch_dp_size - real_batch_size % dispatch_dp_size
-            if dummy_data_size <= real_batch_size:
-                dummy_data = data[:dummy_data_size]
-            else:
-                dummy_data = data.repeat(-(-dummy_data_size // real_batch_size))[:dummy_data_size]
-            data = DataProto.concat([data, dummy_data])
-            print(
-                f'real_batch_size {real_batch_size} is not divisible by dispatch_dp_size {dispatch_dp_size}, add {dummy_data_size} dummy data'
-            )
-
-        batch_size = data.batch['input_ids'].shape[0]
-        assert batch_size % dispatch_dp_size == 0, f'batch_size {batch_size} is not divisible by dispatch_dp_size {dispatch_dp_size}'
-
-        print(f'[{batch_idx+1}/{num_batch}] Start to generate.')
-        # START TO GENERATE FOR n_samples TIMES
-        for i in range(config.data.n_samples):
-            output = wg.generate_sequences(data)
-            # remove dummy data
-            output = output[:real_batch_size]
-            output_text = tokenizer.batch_decode(output.batch['input_ids'][:, -config.rollout.response_length:],
-                                                 skip_special_tokens=False)
-
-            # remove the padding
-            pad_token = tokenizer.pad_token
-            output_text_unpad = []
-            for text in output_text:
-                output_text_unpad.append(text.replace(pad_token, ''))
-
-            output_lst[i].extend(output_text_unpad)
-
-    # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
-    output_lst = np.array(output_lst, dtype=object)
-    output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
-
-    # add to the data frame
-    dataset[f'responses'] = output_lst
-
-    # write to a new parquet
+    # evaluate using reward_function
+    val_reward_fn = NaiveRewardManager(tokenizer=tokenizer, num_examine=1)
+    # Runs reward calculation on parallel threads.
+    reward_tensor = val_reward_fn(test_batch)
+    
+    
+    output_lst =  tokenizer.batch_decode(test_batch.batch['input_ids'][:, -config.rollout.response_length:], skip_special_tokens=False)
+    output_lst = np.array(output_lst).reshape(len(output_lst)//n_val, n_val).tolist()
+    dataset['responses'] = output_lst
+ 
+    # Save the responses to a new parquet before hand.
+    output_dir = os.path.dirname(config.data.output_path)
+    makedirs(output_dir, exist_ok=True)
+    dataset.to_parquet(config.data.output_path)   
+    
+    
+    scores = reward_tensor.sum(-1).cpu().tolist()
+    scores = np.array(scores).reshape(len(scores)//n_val, n_val).tolist()
+    dataset['scores'] = scores
+    # # Write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
     makedirs(output_dir, exist_ok=True)
     dataset.to_parquet(config.data.output_path)
+    
+    # Max across first dim average correct
+    scores = np.array(scores)
+    pass_at_n = np.max(scores, axis=1).mean()
+    pass_at_1 = np.mean(scores)
 
-    return output_text
+    # Save metrics to CSV
+    csv_path = os.path.join(output_dir, 'pass.csv')
+    results_path = os.path.join(output_dir, 'results.json')
+    
+    # Prepare the row data
+    # Extract the dataset name from the path
+    dataset_name = os.path.basename(config.data.path)
+    row_data = {
+        'model_path': config.model.path,
+        'dataset': dataset_name,
+        'pass@1': pass_at_1,
+        f'pass@{n_val}': pass_at_n
+    }
 
+    # Check if file exists
+    file_exists = os.path.isfile(csv_path)
+    
+    # Write to CSV
+    with open(csv_path, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row_data.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_data)
+
+    with open(results_path, 'w') as f:
+        json.dump(scores.tolist(), f)
+
+    # Convert the row data into a list of lists format for tabulate
+    table_data = [[k, v] for k, v in row_data.items()]
+    
+    # Print table
+    print(tabulate(table_data, headers=['Metric', 'Value'], tablefmt='grid'))
 
 if __name__ == '__main__':
     main()
