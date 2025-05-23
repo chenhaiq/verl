@@ -20,7 +20,7 @@ import os
 from contextlib import contextmanager
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 from uuid import uuid4
 
 import numpy as np
@@ -768,3 +768,44 @@ class AsyncSGLangRollout(BaseRollout):
                 req_list.append(req)
 
         return req_list
+
+    def execute_method(self, method: Union[str, bytes], *args, **kwargs):
+        # print(f"AsyncSGLangRollout execute_method, method:{method} args:{args}, kwargs:{kwargs}, self._rank:{self._rank}, self._tp_rank:{self._tp_rank}, self._engine:{self._engine}")
+        print(f"AsyncSGlangRollout self.sampling_params:{self.sampling_params}")
+
+        if method == "chat_completion":
+            json_request = args[0]
+
+            formatted_messages = []
+            for msg in json_request["messages"]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                formatted_messages.append(f"{role}: {content}")
+            prompt_str = "\n".join(formatted_messages)
+
+            sampling_params_dict = {
+                "n": json_request.get("n", 1),
+                "max_new_tokens": json_request.get("max_completion_tokens", self.config.response_length),
+                "temperature": json_request.get("temperature", 1.0),
+                "top_p": json_request.get("top_p", 1.0),
+            }
+
+            loop = asyncio.get_event_loop()
+            output = loop.run_until_complete(
+                self._engine.async_generate(
+                    prompt=prompt_str,
+                    sampling_params=sampling_params_dict,
+                    return_logprob=True,
+                )
+            )
+            [output] = broadcast_pyobj(
+                data=[output],
+                rank=self._rank,
+                dist_group=self._device_mesh_cpu["tp"].get_group(),
+                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                force_cpu_device=False,
+            )
+            print(f"AsyncSGlangRollout output:{output}")
+            return output
+        else:
+            raise ValueError(f"not supported method : {method}")
