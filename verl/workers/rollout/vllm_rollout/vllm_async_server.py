@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -21,7 +22,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
@@ -163,6 +163,7 @@ class AsyncvLLMServer(AsyncServerBase):
         engine_args = AsyncEngineArgs(
             model=local_path,
             enable_sleep_mode=True,
+            disable_log_requests=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend=ExternalRayDistributedExecutor,
@@ -174,7 +175,7 @@ class AsyncvLLMServer(AsyncServerBase):
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
-            disable_log_stats=config.disable_log_stats,
+            disable_log_stats=False,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
@@ -186,7 +187,7 @@ class AsyncvLLMServer(AsyncServerBase):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_stats=False)
 
         # build serving chat
         model_config = self.engine.model_config
@@ -197,12 +198,20 @@ class AsyncvLLMServer(AsyncServerBase):
             model_config,
             models,
             "assistant",
-            request_logger=RequestLogger(max_log_len=4096),
+            # request_logger=RequestLogger(max_log_len=4096),
+            request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
             enable_auto_tools=True,
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
         )
+
+        async def _force_log():
+            while True:
+                await asyncio.sleep(10.0)
+                await self.engine.do_log_stats()
+
+        asyncio.create_task(_force_log())
 
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.

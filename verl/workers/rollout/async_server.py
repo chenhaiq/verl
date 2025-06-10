@@ -16,6 +16,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Tuple, Type
@@ -157,7 +158,7 @@ class AsyncLLMServerManager:
         self.chat_scheduler: ChatCompletionScheduler = None
         self.chat_scheduler_loop = None
         self.chat_scheduler_ready = threading.Event()
-        self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True)
+        self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True, name="chat_scheduler_thread")
         self.chat_scheduler_thread.start()
         self.chat_scheduler_ready.wait()
 
