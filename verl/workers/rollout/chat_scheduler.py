@@ -17,8 +17,11 @@ import importlib
 import itertools
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from queue import Queue
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import aiohttp
@@ -281,7 +284,7 @@ class ChatCompletionScheduler:
             module = importlib.import_module(module_path)
             self.completion_callback = getattr(module, class_name)(config, self)
 
-    def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any]):
+    def submit_chat_completions(self, *, messages: List[Dict[str, str]], request_id: str, info: Dict[str, Any], address: Optional[str] = None):
         """Submit chat completion request without wait, completion_callback will be called when the request is done.
 
         Args:
@@ -290,19 +293,15 @@ class ChatCompletionScheduler:
             info: Any other auxiliary information pass across multi-turn.
         """
         info["__depth__"] += 1
-        task = asyncio.create_task(self._submit_chat_completions_and_callback(messages, request_id, info))
+        task = asyncio.create_task(self._submit_chat_completions_and_callback(messages, request_id, info, address))
 
         # “fire-and-forget” background tasks
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    async def _submit_chat_completions_and_callback(
-        self,
-        messages: List[Dict[str, str]],
-        request_id: str,
-        info: Dict[str, Any],
-    ):
-        """Submit chat completion request, wait request finish and do callback."""
+    def _routing(self, request_id: str, address: str):
+        if address is not None:
+            return address
         if request_id:
             request_id = request_id.removeprefix("chatcmpl-")
             assert request_id in self.request_id_to_address
@@ -311,7 +310,17 @@ class ChatCompletionScheduler:
             address = self.weighted_addresses[0][1]
             self.weighted_addresses[0][0] += 1
             heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
+        return address
 
+    async def _submit_chat_completions_and_callback(
+        self,
+        messages: List[Dict[str, str]],
+        request_id: str,
+        info: Dict[str, Any],
+        address: str = None,
+    ):
+        """Submit chat completion request, wait request finish and do callback."""
+        address = self._routing(request_id, address)
         # use new request_id to avoid duplicate request_id problem
         request_id = uuid4().hex
         self.request_id_to_address[request_id] = address
@@ -403,7 +412,7 @@ class ChatCompletionScheduler:
 
         return self.completion_callback.postprocess(batch, batch_conversations, n=n)
 
-    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any]):
+    async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any], address: str = None):
         done = asyncio.Event()
 
         info = {
@@ -412,7 +421,125 @@ class ChatCompletionScheduler:
             "__sampling_params__": sampling_params,
         }
 
-        self.submit_chat_completions(messages=messages, request_id=request_id, info=info)
+        self.submit_chat_completions(messages=messages, request_id=request_id, info=info, address=address)
 
         # Wait until all completion requests are done
         await done.wait()
+
+
+@dataclass
+class RolloutSample:
+    completions: ChatCompletion
+    info: Dict[str, Any]
+    model_name: str
+    conversation: List[Dict[str, str]]
+    chat_complete_request: Dict[str, Any]
+    exceptoin: Exception
+
+
+class MicroBatchChatCompletionScheduler(ChatCompletionScheduler):
+    def __init__(self, config, model_path, server_addresses, max_cache_size=10000, max_inflight_req=8):
+        super().__init__(config, model_path, server_addresses, max_cache_size)
+        self.send_queue = asyncio.Queue()
+        self.reduce_queue = asyncio.Queue()
+        self.loop = asyncio.get_event_loop()
+        self.max_inflight_req = max_inflight_req
+        self.server_addresses = server_addresses
+        self.proxy_agents_coros = self._init_proxy_group(self.server_addresses, self.send_queue, self.reduce_queue, self.max_inflight_req)
+        logger.debug(self.proxy_agents_coros)
+
+    def _init_proxy_group(self, addrs: List[str], send_queue: asyncio.Queue, reduce_queue: asyncio.Queue, max_inflight_req=4):
+        # we use a group of coroutine to consume send_queue and produce reduce_queue
+        # since the asyncio.Queue is not thread safe.
+        # max_inflight_req consumer coroutine to get element from local_queue and submit to vllm
+        coros = []
+        for addr in addrs:
+            coros.extend([self.process(send_queue, reduce_queue, addr, i) for i in range(max_inflight_req)])
+        for coro in coros:
+            self.loop.create_task(coro)
+        return coros
+
+    async def process(self, local_queue: asyncio.Queue, reduce_queue, addr, idx):
+        logger.info(f"[MicroBatchChatCompletionScheduler] _consumer process start with idx: {idx}")
+        while True:
+            sample: RolloutSample = await local_queue.get()
+            logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, submit to vllm {addr}")
+            try:
+
+                async def callback(completions, info, exception):
+                    info["end_time"] = time.time()
+                    info["duration"] = info["end_time"] - info["start_time"]
+                    logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process callback get completions: idx: {idx}")
+                    await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=exception))
+
+                await self._submit_chat_completions_semaphore(callback=callback, address=addr, callback_additional_info=sample.info, model=sample.model_name, messages=sample.conversation, **sample.chat_complete_request)
+                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process submit to vllm done, idx: {idx}")
+            except Exception as e:
+                logger.error(f"[MicroBatchChatCompletionScheduler] _consumer process exception: {e}, idx: {idx}")
+                await reduce_queue.put(RolloutSample(None, sample.info, None, None, exceptoin=e))
+
+    def _sink_sample(self, sink_queue: Queue[RolloutSample], batch_size):
+        # this is used for debug
+        counter = 0
+        while counter < batch_size:
+            sapmle: RolloutSample = sink_queue.get()
+            torch.save(sapmle, f"sample-{sapmle.info['batch_index']}.pt")
+            counter += 1
+
+    async def _gather_result(self, batch_size, sink_queue: asyncio.Queue = None):
+        batch_conversations = [None] * batch_size
+        counter = 0
+        while counter < batch_size:
+            sample: RolloutSample = await self.reduce_queue.get()
+            logger.debug(f"[MicroBatchChatCompletionScheduler] _gather_result counter: {counter},sample: {sample}")
+            if sink_queue is not None:
+                await sink_queue.put(sample)
+            counter += 1
+            if sample.exceptoin is not None:
+                # assert exception is None, f"exception: {exception}"
+                raise sample.exceptoin
+            conversation, batch_index = (
+                sample.info["conversation"],
+                sample.info["batch_index"],
+            )
+            conversations = []
+            for choice in sample.completions.choices:
+                chat = conversation.copy()
+                chat.append({"role": choice.message.role, "content": choice.message.content})
+                conversations.append(chat)
+            batch_conversations[batch_index] = conversations
+        return batch_conversations
+
+    async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+        kwargs = dict(
+            n=self.config.n,
+            max_completion_tokens=self.config.response_length,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+        )
+        do_sample = batch.meta_info.get("do_sample", True)
+        is_validate = batch.meta_info.get("validate", False)
+        if not do_sample or is_validate:
+            kwargs["n"] = 1
+            kwargs["temperature"] = 0
+
+        kwargs.update(sampling_params)
+        logger.info(f"[MicroBatchChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
+        for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"]):
+            await self.send_queue.put(
+                RolloutSample(
+                    completions=None,
+                    info={
+                        "batch_index": batch_index,
+                        "conversation": list(conversation),
+                    },
+                    conversation=conversation.tolist(),
+                    model_name=self.model_name,
+                    chat_complete_request=kwargs,
+                    exceptoin=None,
+                )
+            )
+        batch_conversations = await self._gather_result(len(batch))
+        logger.info("[MicroBatchChatCompletionScheduler] generate_sequences done")
+
+        return self._postprocess(batch, batch_conversations, kwargs["n"])

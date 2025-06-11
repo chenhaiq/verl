@@ -27,6 +27,10 @@ from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.metrics.loggers import (
+    LoggingStatLogger,
+    PrometheusStatLogger,
+)
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl.utils.fs import copy_to_local
@@ -147,6 +151,7 @@ class AsyncvLLMServer(AsyncServerBase):
         max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
+        stat_log_interval = config.get("stat_log_interval", 10)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -175,7 +180,7 @@ class AsyncvLLMServer(AsyncServerBase):
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
-            disable_log_stats=False,
+            disable_log_stats=config.get("disable_log_stats", False),
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
@@ -187,7 +192,8 @@ class AsyncvLLMServer(AsyncServerBase):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_stats=False)
+        # this will override vllm_config for logging
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_stats=config.get("disable_log_stats", False), stat_loggers=[PrometheusStatLogger, LoggingStatLogger])
 
         # build serving chat
         model_config = self.engine.model_config
@@ -206,12 +212,12 @@ class AsyncvLLMServer(AsyncServerBase):
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
         )
 
-        async def _force_log():
+        async def _force_log(stat_log_interval=10):
             while True:
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(stat_log_interval)
                 await self.engine.do_log_stats()
 
-        asyncio.create_task(_force_log())
+        asyncio.create_task(_force_log(stat_log_interval))
 
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.

@@ -156,7 +156,7 @@ class TestVllmMicroBatchScheduler:
         config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.MicroBatchChatCompletionScheduler"
         config.actor_rollout_ref.rollout.prompt_length = 4096
         config.actor_rollout_ref.rollout.response_length = 4096
-        config.actor_rollout_ref.rollout.temperature = 0.0
+        config.actor_rollout_ref.rollout.temperature = 0.1
         config.actor_rollout_ref.rollout.repetition_penalty = 1.0
         config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
         config.actor_rollout_ref.rollout.preemption_mode = "swap"

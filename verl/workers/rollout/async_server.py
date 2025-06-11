@@ -16,7 +16,6 @@ import logging
 import os
 import socket
 import threading
-import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Tuple, Type
@@ -29,7 +28,7 @@ from starlette.requests import Request
 
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
-from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler
+from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler, MicroBatchChatCompletionScheduler
 
 logger = logging.getLogger(__file__)
 
@@ -162,15 +161,18 @@ class AsyncLLMServerManager:
         self.chat_scheduler_thread.start()
         self.chat_scheduler_ready.wait()
 
-    def _init_chat_scheduler(self):
+    def _init_chat_scheduler(self, chat_scheduler_cls):
         self.chat_scheduler_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.chat_scheduler_loop)
 
-        self.chat_scheduler = ChatCompletionScheduler(
+        _chat_scheduler_cls = chat_scheduler_class(
+            scheduler_str=self.config.chat_scheduler.name,
+        )
+        self.chat_scheduler = _chat_scheduler_cls(
             config=self.full_config,
             server_addresses=self.server_addresses,
         )
-
+        logger.info(f"Chat scheduler is initialized: {self.chat_scheduler}")
         self.chat_scheduler_ready.set()
         self.chat_scheduler_loop.run_forever()
 
@@ -230,3 +232,16 @@ def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
         return AsyncSglangServer
     else:
         raise NotImplementedError
+
+
+def chat_scheduler_class(scheduler_str: str) -> Type[ChatCompletionScheduler]:
+    """Get chat scheduler class.
+    Args:
+        scheduler_str: str, scheduler name, should be "micro_batch" or "default".
+    Returns:
+        Type[ChatCompletionScheduler]: chat scheduler class.
+    """
+    if scheduler_str == "micro_batch":
+        return MicroBatchChatCompletionScheduler
+    else:
+        return ChatCompletionScheduler
