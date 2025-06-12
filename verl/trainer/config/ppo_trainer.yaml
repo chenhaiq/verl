@@ -440,6 +440,9 @@ actor_rollout_ref:
       # null for default callback
       completion_callback: null
 
+    chat_scheduler:
+      name: null
+
 # configs for the critic
 critic:
 

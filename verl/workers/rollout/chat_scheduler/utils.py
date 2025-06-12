@@ -1,11 +1,11 @@
 import asyncio
+import functools
 import logging
 import os
+from abc import abstractmethod
+from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from typing import Any, List
-
-from verl.workers.rollout.chat_scheduler.apis import ActorMeta, WorkFunc
-from verl.workers.rollout.schemas import Message
+from typing import Any, List, Protocol
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_QUEUE_LOGGING_LEVEL", "DEBUG"))
@@ -105,15 +105,24 @@ class QueueGroup:
     def __getitem__(self, idx: int) -> asyncio.Queue:
         return self._queues[idx]
 
+    def __len__(self):
+        return len(self._queues)
+
     async def push(self, idx: int, item: Any):
         # we don't need lock here, because we are using a single thread
         self._queues[idx].put_nowait(item)
         # this heap return the smallest value, so we need to minus 1
         self._heap[idx] -= 1
-        logger.debug(f"push {item} to queue {idx},heap: {self._heap}")
+        print(f"push {item} to queue {idx},heap: {self._heap}")
 
     async def pop(self, idx: int) -> Any:
         item = await self._queues[idx].get()
+        # this heap return the smallest value, so we need to plus 1
+        self._heap[idx] += 1
+        return item
+
+    def pop_nowait(self, idx: int) -> Any:
+        item = self._queues[idx].get_nowait()
         # this heap return the smallest value, so we need to plus 1
         self._heap[idx] += 1
         return item
@@ -123,12 +132,28 @@ class QueueGroup:
             idx = self._heap.smallest()
             item = self._queues[idx].get_nowait()
             self._heap[idx] += 1
-            logger.debug(f"pop {item} from queue {idx},heap: {self._heap}")
+            print(f"pop {item} from queue {idx},heap: {self._heap}")
             return item
         except IndexError:
-            logger.debug("heap is empty")
+            print("heap is empty")
             # none of the queues are non-empty
         return None
+
+
+class Message:
+    pass
+
+
+@dataclass
+class ActorMeta:
+    actor_id: int
+    queue_group: QueueGroup
+
+
+class WorkFunc(Protocol):
+    @abstractmethod
+    async def __call__(self, meta: ActorMeta, message: Message) -> None:
+        pass
 
 
 class WorkStealingActor:
@@ -137,33 +162,34 @@ class WorkStealingActor:
         worker_id: int,
         local_queues: QueueGroup,
         global_queue: asyncio.Queue,
-        func: WorkFunc,
+        work_fn: WorkFunc,
     ):
         self.worker_id = worker_id
-        self.local_queue = local_queues[worker_id]
         self.local_queues = local_queues
         self.global_queue = global_queue
-        self.func = func
+        self.func = work_fn
         self.total_workers = len(local_queues)
-        self.actor_meta = ActorMeta(worker_id, self.local_queue)
+        self.actor_meta = ActorMeta(worker_id, self.local_queues)
         self.queues_to_wait = self._build_priority_queue_list()
 
     def _build_priority_queue_list(self):
-        # await any non-empty queue
-        return [self.local_queue, self.global_queue] + [q for i, q in enumerate(self.local_queues) if i != self.worker_id]
+        return [functools.partial(self.local_queues.pop, self.worker_id), self.global_queue.get] + [functools.partial(self.local_queues.pop, i) for i, _ in enumerate(self.local_queues) if i != self.worker_id]
 
     async def run(self):
+        print("start worker for actor, actor_meta: ", self.actor_meta, flush=True)
         while True:
             task: Message = await self.get_task()
             await self.func(self.actor_meta, task)
 
     async def get_task(self):
         try:
-            return self.local_queue.get_nowait()
+            print("try to get task from local queue", flush=True)
+            return self.local_queues.pop_nowait(self.worker_id)
         except asyncio.QueueEmpty:
             pass
 
         try:
+            print("try to get task from global queue", flush=True)
             return self.global_queue.get_nowait()
         except asyncio.QueueEmpty:
             pass
@@ -173,7 +199,8 @@ class WorkStealingActor:
         if task is not None:
             return task
 
-        get_futures = [asyncio.create_task(q.get()) for q in self.queues_to_wait]
+        get_futures = [asyncio.create_task(func()) for func in self.queues_to_wait]
+        print("wait for task", flush=True)
         done, _ = await asyncio.wait(get_futures, return_when=asyncio.FIRST_COMPLETED)
 
         for task in get_futures:

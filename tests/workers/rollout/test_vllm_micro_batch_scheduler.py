@@ -1,15 +1,17 @@
-import time
+import asyncio
+import os
 from functools import wraps
+from typing import Dict, List
 
 import numpy as np
 import pytest
-import ray
-import torch
 from datasets import load_dataset
 from omegaconf import OmegaConf
+from openai.types.chat.chat_completion import ChatCompletion, ChatCompletionMessage, Choice
 
-from tests.workers.rollout.async_rollout_utils import init_async_rollout_manager
 from verl.protocol import DataProto
+from verl.workers.rollout.chat_scheduler.apis import CallsReq, CoroExternalCallsPlugin
+from verl.workers.rollout.chat_scheduler.chat_scheduler import MicroBatchScheduler, ToolCompletionCallback
 
 do_bench = True
 
@@ -26,7 +28,23 @@ def skip_if_false(exp):
     return decorator
 
 
-class TestVllmMicroBatchScheduler:
+class MyCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugin):
+    def __init__(self, config, scheduler):
+        ToolCompletionCallback.__init__(self, config, scheduler)
+        CoroExternalCallsPlugin.__init__(self, num_workers=2)
+        print("init MyCompletionCallback")
+
+    def hit(self, req):
+        return False
+
+    def __call__(self, req: CallsReq):
+        return req
+
+    def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int):
+        return batch_conversations
+
+
+class TestMicroBatchScheduler:
     @pytest.fixture
     def ray_env(self):
         runtime_env = {
@@ -78,116 +96,163 @@ class TestVllmMicroBatchScheduler:
             ignore_eos=False,
         )
 
-    def test_micro_batch_scheduler(self, ray_env, aime_dataset, small_model_path):
-        ray.init(
-            runtime_env=ray_env,
-        )
-        # Load config
-        config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
-        config.actor_rollout_ref.model.path = small_model_path
-        config.actor_rollout_ref.rollout.mode = "async"
-        config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.MicroBatchChatCompletionScheduler"
-        config.actor_rollout_ref.rollout.prompt_length = 8192
-        config.actor_rollout_ref.rollout.response_length = 8192
-        config.actor_rollout_ref.rollout.temperature = 0.0
-        config.actor_rollout_ref.rollout.repetition_penalty = 1.0
-
-        # Init sandbox and async rollout manager
-        async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"max_inflight_req": 4})
-
-        # Build dataset
-        prompts, dataset = aime_dataset[0], aime_dataset[1]
-        print(f"length of data proto : {len(prompts)}")
-        start_time = time.time()
-        micro_result = async_rollout_manager.generate_sequences(prompts=prompts)
-        print(f"length of micro_result : {len(micro_result)}")
-        print(f"time cost for micro_result : {time.time() - start_time}")
-        torch.save(micro_result, "micro_result.pt")
-        assert len(micro_result) == len(dataset)
-        ray.timeline("micro_batch_scheduler.json")
-        ray.shutdown()
-
-        ray.init(
-            runtime_env=ray_env,
+    @pytest.fixture
+    def chat_completion(self):
+        return ChatCompletion(
+            id="40359df5b352b344bc8e",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(
+                        role="assistant",
+                        content="The answer is 42.",
+                    ),
+                )
+            ],
+            created=1690917600,
+            model="gpt-3.5-turbo",
+            object="chat.completion",
         )
 
-        config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler"
+    def test_global_queue_put(self, ray_env, aime_dataset, small_model_path, chat_completion):
+        os.environ["VERL_QUEUE_LOGGING_LEVEL"] = "DEBUG"
+        os.environ["VERL_LOGGING_LEVEL"] = "DEBUG"
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-        # Init sandbox and async rollout manager
-        async_rollout_manager = init_async_rollout_manager(config)
-        start_time = time.time()
-        native_result = async_rollout_manager.generate_sequences(prompts=prompts)
-        print(f"length of native_result : {len(native_result)}")
-        print(f"time cost for native_result : {time.time() - start_time}")
-        torch.save(native_result, "native_result.pt")
-        assert len(native_result) == len(dataset)
-        ray.timeline("native_batch_scheduler.json")
-        for i in range(len(dataset)):
-            """
-            a[0].__dict__['batch']
-            TensorDict(
-                fields={
-                    attention_mask: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
-                    input_ids: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
-                    position_ids: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
-                    prompts: Tensor(shape=torch.Size([363]), device=cpu, dtype=torch.int64, is_shared=False),
-                    responses: Tensor(shape=torch.Size([8198]), device=cpu, dtype=torch.int64, is_shared=False)},
-                batch_size=torch.Size([]),
-                device=None,
-                is_shared=False)
-            """
-            torch.allclose(micro_result[i].__dict__["batch"]["responses"], native_result[i].__dict__["batch"]["responses"])
-            torch.allclose(micro_result[i].__dict__["batch"]["attention_mask"], native_result[i].__dict__["batch"]["attention_mask"])
-            torch.allclose(micro_result[i].__dict__["batch"]["input_ids"], native_result[i].__dict__["batch"]["input_ids"])
-            torch.allclose(micro_result[i].__dict__["batch"]["position_ids"], native_result[i].__dict__["batch"]["position_ids"])
-            torch.allclose(micro_result[i].__dict__["batch"]["prompts"], native_result[i].__dict__["batch"]["prompts"])
+        async def run_test():
+            # Load config
+            config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
+            config.actor_rollout_ref.model.path = small_model_path
+            config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
+            config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.MyCompletionCallback"
+            prompts, _ = aime_dataset[0], aime_dataset[1]
+            print("length of data proto : ", len(prompts))
+            # Init sandbox and async rollout manager
+            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4])
+            # scheduler._chat_completions_aiohttp = MagicMock()
+            # futures = [asyncio.Future() for i in range(len(prompts))]
+            # for f in futures:
+            #     f.set_result(chat_completion)
+            # scheduler._chat_completions_aiohttp.side_effect = futures
 
-    # @skip_if_false(True)
-    def test_bench_micro_batch_scheduler(self, ray_env, code_dataset, sampling_params, large_model_path):
-        if not do_bench:
-            return
-        ray.init(
-            runtime_env=ray_env,
-        )
-        # Load config
-        config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
-        config.actor_rollout_ref.model.path = large_model_path
-        config.actor_rollout_ref.rollout.mode = "async"
-        config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.MicroBatchChatCompletionScheduler"
-        config.actor_rollout_ref.rollout.prompt_length = 4096
-        config.actor_rollout_ref.rollout.response_length = 4096
-        config.actor_rollout_ref.rollout.temperature = 0.1
-        config.actor_rollout_ref.rollout.repetition_penalty = 1.0
-        config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
-        config.actor_rollout_ref.rollout.preemption_mode = "swap"
-        config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
+            re = await scheduler.generate_sequences(batch=prompts)
+            assert len(re) == len(prompts), "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
 
-        # Init sandbox and async rollout manager
-        async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"max_inflight_req": 384})
-        # Build dataset
-        prompts, dataset = code_dataset()
-        print(f"length of data proto : {len(prompts)}")
-        start_time = time.time()
-        micro_result = async_rollout_manager.generate_sequences(prompts=prompts, **sampling_params)
-        print(f"length of micro_result : {len(micro_result)}")
-        print(f"time cost for micro_result : {time.time() - start_time}")
-        torch.save(micro_result, "1024-micro_result.pt")
-        assert len(micro_result) == len(prompts)
-        ray.timeline("debug-1024-micro_batch_scheduler.json")
-        ray.shutdown()
+        loop.run_until_complete(run_test())
+        loop.close()
 
-        ray.init(
-            runtime_env=ray_env,
-        )
+    # def test_micro_batch_scheduler(self, ray_env, aime_dataset, small_model_path):
+    #     ray.init(
+    #         runtime_env=ray_env,
+    #     )
+    #     # Load config
+    #     config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
+    #     config.actor_rollout_ref.model.path = small_model_path
+    #     config.actor_rollout_ref.rollout.mode = "async"
+    #     config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.MicroBatchChatCompletionScheduler"
+    #     config.actor_rollout_ref.rollout.prompt_length = 8192
+    #     config.actor_rollout_ref.rollout.response_length = 8192
+    #     config.actor_rollout_ref.rollout.temperature = 0.0
+    #     config.actor_rollout_ref.rollout.repetition_penalty = 1.0
 
-        config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler"
+    #     # Init sandbox and async rollout manager
+    #     async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"max_inflight_req": 4})
 
-        # Init sandbox and async rollout manager
-        async_rollout_manager = init_async_rollout_manager(config)
-        start_time = time.time()
-        native_result = async_rollout_manager.generate_sequences(prompts=prompts, **sampling_params)
-        print(f"length of native_result : {len(native_result)}")
-        print(f"time cost for native_result : {time.time() - start_time}")
-        torch.save(native_result, "1024-native_result.pt")
-        assert len(native_result) == len(prompts)
-        ray.timeline("debug-1024-native_batch_scheduler.json")
+    #     # Build dataset
+    #     prompts, dataset = aime_dataset[0], aime_dataset[1]
+    #     print(f"length of data proto : {len(prompts)}")
+    #     start_time = time.time()
+    #     micro_result = async_rollout_manager.generate_sequences(prompts=prompts)
+    #     print(f"length of micro_result : {len(micro_result)}")
+    #     print(f"time cost for micro_result : {time.time() - start_time}")
+    #     torch.save(micro_result, "micro_result.pt")
+    #     assert len(micro_result) == len(dataset)
+    #     ray.timeline("micro_batch_scheduler.json")
+    #     ray.shutdown()
+
+    #     ray.init(
+    #         runtime_env=ray_env,
+    #     )
+
+    #     config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler"
+
+    #     # Init sandbox and async rollout manager
+    #     async_rollout_manager = init_async_rollout_manager(config)
+    #     start_time = time.time()
+    #     native_result = async_rollout_manager.generate_sequences(prompts=prompts)
+    #     print(f"length of native_result : {len(native_result)}")
+    #     print(f"time cost for native_result : {time.time() - start_time}")
+    #     torch.save(native_result, "native_result.pt")
+    #     assert len(native_result) == len(dataset)
+    #     ray.timeline("native_batch_scheduler.json")
+    #     for i in range(len(dataset)):
+    #         """
+    #         a[0].__dict__['batch']
+    #         TensorDict(
+    #             fields={
+    #                 attention_mask: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
+    #                 input_ids: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
+    #                 position_ids: Tensor(shape=torch.Size([8561]), device=cpu, dtype=torch.int64, is_shared=False),
+    #                 prompts: Tensor(shape=torch.Size([363]), device=cpu, dtype=torch.int64, is_shared=False),
+    #                 responses: Tensor(shape=torch.Size([8198]), device=cpu, dtype=torch.int64, is_shared=False)},
+    #             batch_size=torch.Size([]),
+    #             device=None,
+    #             is_shared=False)
+    #         """
+    #         torch.allclose(micro_result[i].__dict__["batch"]["responses"], native_result[i].__dict__["batch"]["responses"])
+    #         torch.allclose(micro_result[i].__dict__["batch"]["attention_mask"], native_result[i].__dict__["batch"]["attention_mask"])
+    #         torch.allclose(micro_result[i].__dict__["batch"]["input_ids"], native_result[i].__dict__["batch"]["input_ids"])
+    #         torch.allclose(micro_result[i].__dict__["batch"]["position_ids"], native_result[i].__dict__["batch"]["position_ids"])
+    #         torch.allclose(micro_result[i].__dict__["batch"]["prompts"], native_result[i].__dict__["batch"]["prompts"])
+
+    # # @skip_if_false(True)
+    # def test_bench_micro_batch_scheduler(self, ray_env, code_dataset, sampling_params, large_model_path):
+    #     if not do_bench:
+    #         return
+    #     ray.init(
+    #         runtime_env=ray_env,
+    #     )
+    #     # Load config
+    #     config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
+    #     config.actor_rollout_ref.model.path = large_model_path
+    #     config.actor_rollout_ref.rollout.mode = "async"
+    #     config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.MicroBatchChatCompletionScheduler"
+    #     config.actor_rollout_ref.rollout.prompt_length = 4096
+    #     config.actor_rollout_ref.rollout.response_length = 4096
+    #     config.actor_rollout_ref.rollout.temperature = 0.1
+    #     config.actor_rollout_ref.rollout.repetition_penalty = 1.0
+    #     config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
+    #     config.actor_rollout_ref.rollout.preemption_mode = "swap"
+    #     config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
+
+    #     # Init sandbox and async rollout manager
+    #     async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"max_inflight_req": 384})
+    #     # Build dataset
+    #     prompts, dataset = code_dataset()
+    #     print(f"length of data proto : {len(prompts)}")
+    #     start_time = time.time()
+    #     micro_result = async_rollout_manager.generate_sequences(prompts=prompts, **sampling_params)
+    #     print(f"length of micro_result : {len(micro_result)}")
+    #     print(f"time cost for micro_result : {time.time() - start_time}")
+    #     torch.save(micro_result, "1024-micro_result.pt")
+    #     assert len(micro_result) == len(prompts)
+    #     ray.timeline("debug-1024-micro_batch_scheduler.json")
+    #     ray.shutdown()
+
+    #     ray.init(
+    #         runtime_env=ray_env,
+    #     )
+
+    #     config.actor_rollout_ref.rollout.chat_scheduler = "examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler"
+
+    #     # Init sandbox and async rollout manager
+    #     async_rollout_manager = init_async_rollout_manager(config)
+    #     start_time = time.time()
+    #     native_result = async_rollout_manager.generate_sequences(prompts=prompts, **sampling_params)
+    #     print(f"length of native_result : {len(native_result)}")
+    #     print(f"time cost for native_result : {time.time() - start_time}")
+    #     torch.save(native_result, "1024-native_result.pt")
+    #     assert len(native_result) == len(prompts)
+    #     ray.timeline("debug-1024-native_batch_scheduler.json")

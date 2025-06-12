@@ -28,7 +28,7 @@ from starlette.requests import Request
 
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
-from verl.workers.rollout.chat_scheduler.chat_scheduler import ChatCompletionScheduler, MicroBatchChatCompletionScheduler
+from verl.workers.rollout.chat_scheduler.chat_scheduler import ChatCompletionScheduler, MicroBatchScheduler
 
 logger = logging.getLogger(__file__)
 
@@ -242,6 +242,6 @@ def chat_scheduler_class(scheduler_str: str) -> Type[ChatCompletionScheduler]:
         Type[ChatCompletionScheduler]: chat scheduler class.
     """
     if scheduler_str == "micro_batch":
-        return MicroBatchChatCompletionScheduler
+        return MicroBatchScheduler
     else:
         return ChatCompletionScheduler

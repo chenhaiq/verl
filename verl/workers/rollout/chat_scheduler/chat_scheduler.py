@@ -15,23 +15,292 @@ import asyncio
 import functools
 import heapq
 import importlib
+import itertools
+import json
 import logging
+import os
 import threading
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-import aiohttp
+import numpy as np
+import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig
 from openai import AsyncOpenAI
-from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.chat.chat_completion import ChatCompletion, Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
+from tensordict import TensorDict
 
 from verl.protocol import DataProto
-from verl.workers.rollout.chat_scheduler.apis import AsyncCallbackMixin, CallsReq, RolloutReq, RolloutResp
-from verl.workers.rollout.chat_scheduler.callback import ToolCompletionCallback
+from verl.tools.base_tool import initialize_tools_from_config
+from verl.utils.fs import copy_to_local
+from verl.utils.tokenizer import hf_tokenizer
+from verl.workers.rollout.chat_scheduler.apis import AsyncCallbackMixin, CallsReq, CoroExternalCallsPlugin, RolloutReq, RolloutResp
 from verl.workers.rollout.chat_scheduler.utils import ActorMeta, QueueGroup, WorkStealingActor
 
 logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class CompletionCallback(ABC):
+    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
+        self.config = config
+        self.scheduler = scheduler
+
+        # Initialize tools from config file
+        self.max_turns = config.actor_rollout_ref.rollout.multi_turn.max_turns
+        tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
+        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        self.tools = {tool.name: tool for tool in tool_list}
+        self._tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        print(f"Initialized tools: {self.tools}", flush=True)
+
+        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+
+    @property
+    def tool_schemas(self):
+        """OpenAI JSON tool schemas."""
+        return self._tool_schemas
+
+    @property
+    def extra_body(self) -> Dict[str, Any]:
+        """Extra body pass to OpenAI API."""
+        return None
+
+    @abstractmethod
+    async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
+        """Call back function to process completions.
+
+        Args:
+            messages: List of messages including raw prompt and assistant, tool response generated so far.
+            completions: Chat completions from OpenAI compatible server.
+            info: Any other auxiliary information pass across multi-turn.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int) -> DataProto:
+        """Post process batch data.
+
+        Args:
+            batch: Batch input messages from RLHFDataset.
+            batch_conversations: List of messages including raw prompt, assistant response, tool response.
+                Note that `len(batch_conversations) == len(batch) * n`, e.g n=2,
+                batch_conversations=[messages_0_0, messages_0_1, messages_1_0, messages_1_1, ...]
+            n: How many chat completion choices to generate for each input message.
+
+        Returns:
+            Batch data, should include ["prompts", "responses", "response_mask", "input_ids", "attention_mask", "position_ids"].
+        """
+        raise NotImplementedError
+
+
+class ToolCompletionCallback(CompletionCallback):
+    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
+        super().__init__(config, scheduler)
+
+        # TODO: add reward manager to calculate reward score once a sample finish
+
+    async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
+        message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
+        if "content" not in message:
+            message["content"] = ""
+        messages.append(message)
+        finish_reason = completions.choices[0].finish_reason
+
+        # STEP 0: check if we reach max turns
+        if self.max_turns and len(messages) >= self.max_turns:
+            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
+            return
+
+        # STEP 1: check if the model called tools
+        if finish_reason != "tool_calls":
+            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
+            return
+
+        # STEP 2: call tools
+        tool_calls = completions.choices[0].message.tool_calls
+        print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
+        tasks = []
+        for tool_call in tool_calls:
+            tasks.append(self._call_tool(tool_call))
+        tool_responses = await asyncio.gather(*tasks)
+        if any(isinstance(item, Exception) for item in tool_responses):
+            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
+            return
+        messages.extend(tool_responses)
+
+        # STEP 3: resubmit completion request with tool responses
+        self.scheduler.submit_chat_completions(messages=messages, request_id=completions.id, info=info)
+
+    async def _call_tool(self, tool_call) -> Dict[str, str]:
+        """Call tool and return tool response."""
+        tool_name = tool_call.function.name
+        tool_args = json.loads(tool_call.function.arguments)
+        tool = self.tools[tool_name]
+
+        instance_id = await tool.create()
+        try:
+            tool_response, tool_reward_score, tool_metrics = await tool.execute(instance_id, tool_args)
+        except Exception as e:
+            logger.exception(f"Error when executing tool: {e}")
+            return e
+        finally:
+            await tool.release(instance_id)
+
+        return {
+            "role": "tool",
+            "content": tool_response,
+            "tool_call_id": tool_call.id,
+        }
+
+    def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int) -> DataProto:
+        # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
+        # prompts: left pad
+        # responses: right pad
+        # input_ids: prompt + response
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+
+        # prompts: [prompt] from input dataset
+        prompts = [self.tokenizer.apply_chat_template(prompt, tools=self.tool_schemas, add_generation_prompt=True, tokenize=False) for prompt in batch.non_tensor_batch["raw_prompt"]]
+        assert len(batch_conversations) == len(prompts) * n
+
+        # sequences: [prompt + response]
+        sequences = [self.tokenizer.apply_chat_template(conversation, tools=self.tool_schemas, add_generation_prompt=False, tokenize=False) for conversation in batch_conversations]
+
+        # responses: [response]
+        responses = [sequence[len(prompts[i // n]) :] for i, sequence in enumerate(sequences)]
+
+        prompts = self.tokenizer(prompts, return_tensors="pt", padding="longest", padding_side="left")
+        responses = self.tokenizer(responses, return_tensors="pt", padding="longest", padding_side="right")
+        if n > 1:
+            prompts["input_ids"] = prompts["input_ids"].repeat_interleave(n, dim=0)
+            prompts["attention_mask"] = prompts["attention_mask"].repeat_interleave(n, dim=0)
+
+        # response_mask: response mask with tools calling masked out
+        response_mask = self._mask_out_tools_calling_tokens(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0), batch_conversations, responses["input_ids"], responses["attention_mask"])
+
+        input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
+        position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
+
+        batch = TensorDict(
+            {
+                "prompts": prompts["input_ids"],  # [bsz, prompt_length]
+                "responses": responses["input_ids"],  # [bsz, response_length]
+                "response_mask": response_mask,  # [bsz, response_length]
+                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
+                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                "position_ids": position_ids,  # [bsz, prompt_length + response_length]
+            },
+            batch_size=len(input_ids),
+        )
+
+        num_turns = np.array([len(conversation) for conversation in batch_conversations], dtype=np.int32)
+        return DataProto(batch=batch, non_tensor_batch={"__num_turns__": num_turns})
+
+    def _mask_out_tools_calling_tokens(
+        self,
+        raw_prompts: List[List[Dict[str, str]]],
+        batch_conversations: List[List[Dict[str, str]]],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mask out tools calling tokens in the responses.
+
+        Args:
+            raw_prompts: [prompt] from input dataset
+            batch_conversations: [prompt + response]
+            input_ids: responses tokens
+            attention_mask: responses attention mask
+
+        Returns:
+            mask: (batch_size, response_length)
+        """
+        batch_size = input_ids.size(0)
+        assert len(raw_prompts) == batch_size, f"{len(raw_prompts)} != {batch_size}"
+        assert len(batch_conversations) == batch_size, f"{len(batch_conversations)} != {batch_size}"
+
+        # Deduplicate adjacent tool calls, since they're merged into one turn.
+        # [user, assistant, tool, tool, assistant] -> [user, assistant, tool, assistant]
+        # TODO: it's chat_template specific, find a more generic way to do this.
+        def deduplicate_adjacent_tool_calls(roles):
+            result = []
+            for role, group in itertools.groupby(roles):
+                if role == "tool":
+                    result.append(role)
+                else:
+                    result.extend(group)
+            return result
+
+        loss_mask = attention_mask.clone()
+        for i in range(batch_size):
+            responses = batch_conversations[i][len(raw_prompts[i]) :]
+            assert len(responses) > 0, f"responses is empty: {responses}"
+
+            roles = deduplicate_adjacent_tool_calls([response["role"] for response in responses])
+            # Each turn should be: [BOS]...[EOS]
+            eos_indices = input_ids[i].eq(self.tokenizer.eos_token_id).nonzero().squeeze(1)[: len(roles)]
+            for j in range(len(roles)):
+                if roles[j] == "tool":
+                    bos = eos_indices[j - 1] + 1 if j > 0 else 0
+                    eos = eos_indices[j]
+                    loss_mask[i, bos : eos + 1] = 0
+
+        return loss_mask
+
+
+class AsyncToolCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugin):
+    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
+        ToolCompletionCallback.__init__(self, config, scheduler)
+        CoroExternalCallsPlugin.__init__(self)
+
+    def hit(self, req: CallsReq):
+        completions = req.completions
+        messages = req.messages
+        finish_reason = completions.choices[0].finish_reason
+
+        # STEP 0: check if we reach max turns
+        if self.max_turns and len(messages) >= self.max_turns:
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
+            return True
+
+        # STEP 1: check if the model called tools
+        if finish_reason != "tool_calls":
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
+            return False
+
+    async def __call__(self, req: CallsReq):
+        completions = req.rollout_resp.completions
+        messages = req.rollout_resp.messages
+        finish_reason = completions.choices[0].finish_reason
+
+        # call tools
+        tool_calls = completions.choices[0].message.tool_calls
+        logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
+        tasks = []
+        for tool_call in tool_calls:
+            tasks.append(self._call_tool(tool_call))
+        tool_responses = await asyncio.gather(*tasks)
+        if any(isinstance(item, Exception) for item in tool_responses):
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
+            return
+        messages.extend(tool_responses)
+
+        # STEP 3: send it back to local_queue
+        new_rollout_req = RolloutReq(
+            completions=None,
+            info=req.rollout_resp.info,
+            messages=messages,
+            model_name=req.rollout_resp.model_name,
+            chat_complete_request=req.rollout_resp.chat_complete_request,
+            exceptoin=None,
+        )
+        req.actor_meta.queue_group.push(req.actor_meta.actor_id, new_rollout_req)
 
 
 class ChatCompletionScheduler:
@@ -142,21 +411,37 @@ class ChatCompletionScheduler:
         return await client.chat.completions.create(**chat_complete_request)
 
     async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
-        try:
-            extra_body = chat_complete_request.pop("extra_body", {})
-            chat_complete_request.update(extra_body or {})
-            extra_headers = chat_complete_request.pop("extra_headers")
-            timeout = aiohttp.ClientTimeout(total=None)
-            session = aiohttp.ClientSession(timeout=timeout)
-            async with session.post(
-                url=f"http://{address}/v1/chat/completions",
-                headers={"Authorization": "Bearer token-abc123", **extra_headers},
-                json=chat_complete_request,
-            ) as resp:
-                data = await resp.json()
-                return ChatCompletion(**data)
-        finally:
-            await session.close()
+        return ChatCompletion(
+            id="40359df5b352b344bc8e",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(
+                        role="assistant",
+                        content="The answer is 42.",
+                    ),
+                )
+            ],
+            created=1690917600,
+            model="gpt-3.5-turbo",
+            object="chat.completion",
+        )
+        # try:
+        #     extra_body = chat_complete_request.pop("extra_body", {})
+        #     chat_complete_request.update(extra_body or {})
+        #     extra_headers = chat_complete_request.pop("extra_headers")
+        #     timeout = aiohttp.ClientTimeout(total=None)
+        #     session = aiohttp.ClientSession(timeout=timeout)
+        #     async with session.post(
+        #         url=f"http://{address}/v1/chat/completions",
+        #         headers={"Authorization": "Bearer token-abc123", **extra_headers},
+        #         json=chat_complete_request,
+        #     ) as resp:
+        #         data = await resp.json()
+        #         return ChatCompletion(**data)
+        # finally:
+        #     await session.close()
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         kwargs = dict(
@@ -211,21 +496,21 @@ class ChatCompletionScheduler:
 
 
 class MicroBatchScheduler(ChatCompletionScheduler):
-    def __init__(self, config, model_path, server_addresses, max_cache_size=10000, max_inflight_req=8, external_calls_plugins: List[AsyncCallbackMixin] = None):
-        super().__init__(config, model_path, server_addresses, max_cache_size)
+    def __init__(self, config, server_addresses, max_cache_size=10000, max_inflight_req=8):
+        super().__init__(config, server_addresses, max_cache_size)
         self._validate_callback()
         self.max_inflight_req = max_inflight_req
         self.server_addresses = server_addresses
         self.number_of_servers = len(server_addresses)
-        self.external_calls_plugins = external_calls_plugins
         self._init_global_resource()
-        self.engine_call_actors = self._init_engine_call_actors(server_address=server_addresses, send_queue=self.send_queue, reduce_queue=self.reduce_queue)
+        self.engine_call_actors = self._init_engine_call_actors(server_address=server_addresses, max_inflight_req=max_inflight_req)
 
     def _validate_callback(self):
         if self.completion_callback is None:
             raise ValueError("completion_callback is None")
         if not isinstance(self.completion_callback, AsyncCallbackMixin):
             raise ValueError("completion_callback mixin AsyncCallbackMixin")
+        print(f"completion_callback: {self.completion_callback}")
 
     def _init_reduce_thread(self):
         self.reduce_thread = threading.Thread(target=self.handle_reduce_req, args=(self.reduce_data_queue,), daemon=True, name="reduce_data_thread")
@@ -244,20 +529,22 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         # max_inflight_req consumer coroutine to get element from local_queue and submit to vllm
         actors = []
         for idx, addr in enumerate(server_address):
+            print(f"[MicroBatchChatCompletionScheduler] init engine call actor {addr}, max_inflight_req: {max_inflight_req}")
             for _ in range(max_inflight_req):
                 work_fn = functools.partial(self.handle_rollout_req, addr, self.tool_req_queue, self.reduce_data_queue)
                 actor = WorkStealingActor(worker_id=idx, local_queues=self.local_data_queue_group, global_queue=self.global_data_queue, work_fn=work_fn)
                 actors.append(actor)
                 asyncio.create_task(actor.run())
+        print(f"[MicroBatchChatCompletionScheduler] init engine call actors done, total: {len(actors)}")
         return actors
 
     async def handle_rollout_req(self, addr, reduce_queue: asyncio.Queue, external_call: AsyncCallbackMixin, actor_meta: ActorMeta, rollout_req: RolloutReq):
-        logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, submit to engine {addr}")
         request_id = uuid4().hex
         completions, exception = None, None
         messages = rollout_req.messages
         try:
             # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
+            print(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, submit to engine {addr}")
             completions = await self._chat_completions_aiohttp(
                 address=addr,
                 messages=messages,
@@ -269,6 +556,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         except Exception as e:
             # Let user handle the exception
             exception = e
+        print(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, submit to engine {addr} done, completions: {completions}")
         message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
         if "content" not in message:
             message["content"] = ""
@@ -277,36 +565,29 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         if external_call.hit(resp):
             external_call.put(CallsReq(rollout_resp=resp, actor_meta=actor_meta))
         else:
+            print(f"[MicroBatchChatCompletionScheduler] _consumer process put sample to reduce_queue,idx: {actor_meta.actor_id}")
             reduce_queue.put(resp)
-        logger.debug("[MicroBatchChatCompletionScheduler] _consumer process done")
+        print("[MicroBatchChatCompletionScheduler] _consumer process done")
 
     # maybe we can make this sink_queue as a pubsub proxy using zmq
     async def handle_reduce_req(self, batch_size, sink_queue: asyncio.Queue = None):
         batch_conversations = [None] * batch_size
         counter = 0
         while counter < batch_size:
+            print(f"[MicroBatchChatCompletionScheduler] _gather_result counter: {counter}")
             sample: RolloutResp = await self.reduce_data_queue.get()
-            logger.debug(f"[MicroBatchChatCompletionScheduler] _gather_result counter: {counter},sample: {sample}")
+            print(f"[MicroBatchChatCompletionScheduler] _gather_result counter: {counter},sample: {sample}")
             if sink_queue is not None:
                 sink_queue.put(sample)
             counter += 1
             if sample.exception is not None:
                 # assert exception is None, f"exception: {exception}"
                 raise sample.exception
-            conversation, batch_index = (
-                sample.info["conversation"],
-                sample.info["batch_index"],
-            )
-            conversations = []
-            for choice in sample.completions.choices:
-                chat = conversation.copy()
-                chat.append({"role": choice.message.role, "content": choice.message.content})
-                conversations.append(chat)
-            batch_conversations[batch_index] = conversations
+            batch_conversations[counter] = sample.messages
         logger.debug("[MicroBatchChatCompletionScheduler] _gather_result done for one batch")
         return batch_conversations
 
-    async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+    async def generate_sequences(self, batch: DataProto) -> DataProto:
         kwargs = dict(
             model=self.model_name,
             temperature=self.config.temperature,
@@ -318,7 +599,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             kwargs["top_p"] = self.config.val_kwargs.top_p
             kwargs["temperature"] = self.config.val_kwargs.temperature
 
-        logger.info(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
+        print(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
 
         # NOTE: For multi-turn rollout, repeat raw_prompt n times and process each prompt independently,
         # validation dataset has already been repeated in `PPOTrainer._validate`.
@@ -328,19 +609,17 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             # raw_prompt: [{"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
             batch_conversations[batch_index] = conversation.tolist()
 
-            await self.send_queue.put(
+            self.global_data_queue.put_nowait(
                 RolloutReq(
                     completions=None,
-                    info={
-                        "batch_index": batch_index,
-                        "conversation": list(conversation),
-                    },
                     messages=conversation.tolist(),
                     model_name=self.model_name,
-                    chat_complete_request=kwargs,
-                    exceptoin=None,
+                    sampling_params=kwargs,
+                    tools_schema=self.completion_callback.tool_schemas,
+                    extra_body=self.completion_callback.extra_body,
                 )
             )
-        batch_conversations = await self._gather_result(len(batch))
+        print("[MicroBatchChatCompletionScheduler] generate_sequences start, with len(batch): ")
+        batch_conversations = await self.handle_reduce_req(len(batch))
         logger.info("[MicroBatchChatCompletionScheduler] generate_sequences done")
         return self.completion_callback.postprocess(batch, batch_conversations, n=n)
