@@ -174,6 +174,12 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     async def flush_cache(self):
         return await self.tokenizer_manager.flush_cache()
 
+    async def start_profile(self):
+        return await self.tokenizer_manager.start_profile()
+
+    async def stop_profile(self):
+        return await self.tokenizer_manager.stop_profile()
+
 
 # NOTE(sgm): add for verl. We can optimize it by making
 #  the dataloader yield List[int] without padding.
@@ -1190,10 +1196,14 @@ class SGLangRollout(BaseRollout):
             return
         await self.sharding_manager.wake_up()  # pylint: disable=C2801
         self.is_sleep = False
+        print("engine.start_profile")
+        await self._engine.start_profile()
 
     # this function is left for uniform train-inference resharding
     async def sleep(self):
         if self.is_sleep:
             return
+        print("engine.stop_profile")
+        await self._engine.stop_profile()
         await self.sharding_manager.sleep()
         self.is_sleep = True

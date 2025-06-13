@@ -163,7 +163,7 @@ class MicroBatchChatCompletionScheduler(NaiveChatCompletionScheduler):
         self.proxy_agents_coros = self._init_proxy_group(self.server_addresses, self.send_queue, self.reduce_queue, self.max_inflight_req)
         logger.debug(self.proxy_agents_coros)
 
-    def _init_proxy_group(self, addrs: List[str], send_queue: Queue, reduce_queue: Queue, max_inflight_req=4):
+    def _init_proxy_group(self, addrs: List[str], send_queue: Queue, reduce_queue: Queue, max_inflight_req=8):
         # we use a group of coroutine to consume send_queue and produce reduce_queue
         # since the asyncio.Queue is not thread safe.
         # ideadly we have 1 get_elements coroutine to get element from send_queue and put to local_queue
@@ -177,24 +177,80 @@ class MicroBatchChatCompletionScheduler(NaiveChatCompletionScheduler):
 
     async def process(self, local_queue, reduce_queue, addr, idx):
         logger.info("[MicroBatchChatCompletionScheduler] _consumer process start with idx: ", idx)
+        batch_to_submit = []
         while True:
-            sample: RolloutSample = await local_queue.get()
-            logger.debug("[MicroBatchChatCompletionScheduler] _consumer process get sample, submit to vllm", addr)
             try:
+                # Try to get an item immediately
+                sample: RolloutSample = local_queue.get_nowait()
+                batch_to_submit.append(sample)
+            except asyncio.QueueEmpty:
+                # If queue is empty, and we have a batch, process it
+                if batch_to_submit:
+                    logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} collected {len(batch_to_submit)} samples, submitting to vllm at {addr}")
+                    tasks = []
+                    for batched_sample in batch_to_submit:
 
-                async def callback(completions, info, exception):
-                    if exception is not None:
-                        logger.debug("[MicroBatchChatCompletionScheduler] _consumer process callback get exception", idx)
-                        await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=exception))
-                    else:
-                        logger.debug("[MicroBatchChatCompletionScheduler] _consumer process callback get completions", idx)
-                        await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=None))
+                        async def callback(completions, info, exception, original_sample=batched_sample):
+                            if exception is not None:
+                                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} callback get exception for sample {original_sample.info.get('batch_index')}")
+                                await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=exception))
+                            else:
+                                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} callback get completions for sample {original_sample.info.get('batch_index')}")
+                                await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=None))
 
-                await self.submit_chat_completions(callback=callback, address=addr, callback_additional_info=sample.info, model=sample.model_name, messages=sample.conversation, **sample.chat_complete_request)
-                logger.debug("[MicroBatchChatCompletionScheduler] _consumer process submit to vllm done", idx)
-            except Exception as e:
-                logger.error("[MicroBatchChatCompletionScheduler] _consumer process exception", idx, e)
-                await reduce_queue.put(RolloutSample(None, sample.info, None, None, exceptoin=e))
+                        tasks.append(self.submit_chat_completions(callback=callback, address=addr, callback_additional_info=batched_sample.info, model=batched_sample.model_name, messages=batched_sample.conversation, **batched_sample.chat_complete_request))
+                    try:
+                        await asyncio.gather(*tasks)
+                        logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} submitted batch of {len(batch_to_submit)} to vllm done")
+                    except Exception as e:
+                        logger.error(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} exception during batch submission: {e}")
+                        # Handle individual errors if gather fails, or put all as failed
+                        for failed_sample in batch_to_submit:
+                            await reduce_queue.put(RolloutSample(None, failed_sample.info, None, None, None, exceptoin=e))
+                    batch_to_submit = []
+                # Wait for 1 second before trying to get new items
+                await asyncio.sleep(1)
+                continue  # restart the loop to check for new items or process current batch
+
+            # If we got an item, try to collect more for up to 1 second or if queue becomes empty
+            if batch_to_submit:  # This check ensures we only enter the collection phase if we have at least one item
+                collection_start_time = self.loop.time()
+                while True:
+                    if self.loop.time() - collection_start_time >= 1.0:
+                        break  # Max collection time reached
+                    try:
+                        # Try to get more items without waiting too long (e.g., 0.01s timeout or nowait)
+                        additional_sample: RolloutSample = await asyncio.wait_for(local_queue.get(), timeout=0.01)
+                        batch_to_submit.append(additional_sample)
+                    except (asyncio.QueueEmpty, asyncio.TimeoutError):
+                        break  # No more items or timeout for individual get
+
+                # After collecting, process the batch (similar to the block above)
+                if batch_to_submit:
+                    logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} collected {len(batch_to_submit)} samples after waiting, submitting to vllm at {addr}")
+                    tasks = []
+                    for batched_sample_in_loop in batch_to_submit:
+
+                        async def callback_in_loop(completions, info, exception, original_sample_in_loop=batched_sample_in_loop):
+                            if exception is not None:
+                                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} callback get exception for sample {original_sample_in_loop.info.get('batch_index')}")
+                                await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=exception))
+                            else:
+                                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} callback get completions for sample {original_sample_in_loop.info.get('batch_index')}")
+                                await reduce_queue.put(RolloutSample(completions, info, None, None, None, exceptoin=None))
+
+                        tasks.append(self.submit_chat_completions(callback=callback_in_loop, address=addr, callback_additional_info=batched_sample_in_loop.info, model=batched_sample_in_loop.model_name, messages=batched_sample_in_loop.conversation, **batched_sample_in_loop.chat_complete_request))
+                    try:
+                        await asyncio.gather(*tasks)
+                        logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} submitted batch of {len(batch_to_submit)} (after wait) to vllm done")
+                    except Exception as e:
+                        logger.error(f"[MicroBatchChatCompletionScheduler] _consumer process {idx} exception during batch submission (after wait): {e}")
+                        for failed_sample_in_loop in batch_to_submit:
+                            await reduce_queue.put(RolloutSample(None, failed_sample_in_loop.info, None, None, None, exceptoin=e))
+                    batch_to_submit = []
+            # If after all attempts, batch_to_submit is still empty, sleep to prevent busy-waiting
+            if not batch_to_submit:
+                await asyncio.sleep(0.1)  # Short sleep if nothing was processed
 
     async def _gather_result(self, batch_size):
         batch_conversations = [None] * batch_size
