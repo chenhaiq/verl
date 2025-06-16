@@ -2,6 +2,7 @@ import asyncio
 import os
 from functools import wraps
 from typing import Dict, List
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
@@ -115,7 +116,8 @@ class TestMicroBatchScheduler:
             object="chat.completion",
         )
 
-    def test_global_queue_put(self, ray_env, aime_dataset, small_model_path, chat_completion):
+    @patch("verl.workers.rollout.chat_scheduler.requests.chat_completions_aiohttp", new_callable=AsyncMock)
+    def test_global_queue_put(self, mock_chat_completions_aiohttp: AsyncMock, ray_env, aime_dataset, small_model_path, chat_completion):
         os.environ["VERL_QUEUE_LOGGING_LEVEL"] = "DEBUG"
         os.environ["VERL_LOGGING_LEVEL"] = "DEBUG"
         loop = asyncio.new_event_loop()
@@ -123,6 +125,7 @@ class TestMicroBatchScheduler:
 
         async def run_test():
             # Load config
+            mock_chat_completions_aiohttp.return_value = chat_completion
             config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
             config.actor_rollout_ref.model.path = small_model_path
             config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
@@ -130,17 +133,14 @@ class TestMicroBatchScheduler:
             prompts, _ = aime_dataset[0], aime_dataset[1]
             print("length of data proto : ", len(prompts))
             # Init sandbox and async rollout manager
-            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4])
-            # scheduler._chat_completions_aiohttp = MagicMock()
-            # futures = [asyncio.Future() for i in range(len(prompts))]
-            # for f in futures:
-            #     f.set_result(chat_completion)
-            # scheduler._chat_completions_aiohttp.side_effect = futures
+            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2)
 
             re = await scheduler.generate_sequences(batch=prompts)
             assert len(re) == len(prompts), "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
+            await scheduler.shut_down_actors()
 
         loop.run_until_complete(run_test())
+        loop.stop()
         loop.close()
 
     # def test_micro_batch_scheduler(self, ray_env, aime_dataset, small_model_path):

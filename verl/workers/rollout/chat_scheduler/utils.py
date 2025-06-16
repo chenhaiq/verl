@@ -116,10 +116,14 @@ class QueueGroup:
         print(f"push {item} to queue {idx},heap: {self._heap}")
 
     async def pop(self, idx: int) -> Any:
-        item = await self._queues[idx].get()
-        # this heap return the smallest value, so we need to plus 1
-        self._heap[idx] += 1
-        return item
+        try:
+            item = await self._queues[idx].get()
+            # this heap return the smallest value, so we need to plus 1
+            self._heap[idx] += 1
+            return item
+        except asyncio.CancelledError as err:
+            print(f"pop from queue {idx} cancelled")
+            raise asyncio.CancelledError(f"pop from queue {idx} cancelled") from err
 
     def pop_nowait(self, idx: int) -> Any:
         item = self._queues[idx].get_nowait()
@@ -134,7 +138,7 @@ class QueueGroup:
             self._heap[idx] += 1
             print(f"pop {item} from queue {idx},heap: {self._heap}")
             return item
-        except IndexError:
+        except asyncio.QueueEmpty:
             print("heap is empty")
             # none of the queues are non-empty
         return None
@@ -148,6 +152,7 @@ class Message:
 class ActorMeta:
     actor_id: int
     queue_group: QueueGroup
+    local_id: int
 
 
 class WorkFunc(Protocol):
@@ -160,50 +165,111 @@ class WorkStealingActor:
     def __init__(
         self,
         worker_id: int,
+        local_id: int,
         local_queues: QueueGroup,
         global_queue: asyncio.Queue,
         work_fn: WorkFunc,
     ):
         self.worker_id = worker_id
+        self.local_id = local_id
         self.local_queues = local_queues
         self.global_queue = global_queue
         self.func = work_fn
         self.total_workers = len(local_queues)
-        self.actor_meta = ActorMeta(worker_id, self.local_queues)
+        self.actor_meta = ActorMeta(worker_id, self.local_queues, self.local_id)
         self.queues_to_wait = self._build_priority_queue_list()
+        self.coro = self._init_actor_coro()
+        self.cur_task = None
+        self.queue_task = []
+        self.blocker: asyncio.Event = asyncio.Event()
+        self.shutdown_flag = False
+        self.shutdown_done = asyncio.Event()
 
     def _build_priority_queue_list(self):
         return [functools.partial(self.local_queues.pop, self.worker_id), self.global_queue.get] + [functools.partial(self.local_queues.pop, i) for i, _ in enumerate(self.local_queues) if i != self.worker_id]
 
     async def run(self):
         print("start worker for actor, actor_meta: ", self.actor_meta, flush=True)
-        while True:
-            task: Message = await self.get_task()
-            await self.func(self.actor_meta, task)
+        while not self.shutdown_flag:
+            try:
+                task = await self.get_task()
+                logger.debug(f"get task {task} from queue, actor_meta: {self.actor_meta}")
+                coros = self.func(self.actor_meta, task)
+                self.cur_task: asyncio.Task = asyncio.ensure_future(coros)
+                await self.cur_task
+            except asyncio.CancelledError:
+                # this means the work function didn't hanlde the canceled error
+                # we need to cancel the task
+                print(f"cancel task {task}, actor_meta: {self.actor_meta}", flush=True)
+            except Exception as e:
+                print(f"Fatal Error: task {task} failed, actor_meta: {self.actor_meta}, error: {e}", flush=True)
+            finally:
+                self.cur_task = None
+                print(f"finish task, actor_meta: {self.actor_meta}", flush=True)
+        self.shutdown_done.set()
+        print(f"shutdown done with actor meta: {self.actor_meta}", flush=True)
+
+    def _init_actor_coro(self):
+        self.coro = asyncio.create_task(self.run())
+
+    async def cancel_task(self):
+        if self.cur_task is not None and (self.cur_task.done() or self.cur_task.cancelled()):
+            evt = asyncio.Event()
+            self.cur_task.add_done_callback(functools.partial(self._set_evt, evt=evt))
+            print(self.cur_task.print_stack())
+            self.cur_task.cancel()
+            await evt.wait()
+        # set blocker
+        self.blocker.clear()
+
+    def wakeup(self):
+        self.blocker.set()
+        print("wakeup worker skipped, because worker is not blocked", flush=True)
+
+    def _set_evt(self, task, evt: asyncio.Event):
+        print(task, evt)
+        evt.set()
+
+    async def shutdown(self):
+        print("ready to shut down actor: ", self.actor_meta, flush=True)
+        self.shutdown_flag = True
+        event = []
+        task_to_cancel = self.queue_task
+        task_to_cancel.append(self.coro)
+        if self.cur_task is not None:
+            task_to_cancel.append(self.cur_task)
+        for task in task_to_cancel:
+            if task is not None and (not task.done() or not task.cancelled()):
+                evt = asyncio.Event()
+                event.append(evt.wait())
+                task.add_done_callback(functools.partial(self._set_evt, evt=evt))
+                task.cancel()
+        print("wait for done callback with length: ", self.actor_meta, len(event), flush=True)
+        await asyncio.gather(*event)
+        print("shutdown done for actor meta: ", self.actor_meta, flush=True)
 
     async def get_task(self):
+        await self.blocker.wait()
+        logger.debug(f"blocker acquire with actor_meta: {self.actor_meta}")
         try:
-            print("try to get task from local queue", flush=True)
+            logger.debug(f"try to get task from local queue, actor meta: {self.actor_meta}")
             return self.local_queues.pop_nowait(self.worker_id)
         except asyncio.QueueEmpty:
             pass
-
         try:
-            print("try to get task from global queue", flush=True)
+            logger.debug("try to get task from global queue")
             return self.global_queue.get_nowait()
         except asyncio.QueueEmpty:
             pass
-
-        # Steal from the longest queue using max-heap (shared heap)
+        logger.debug("try to steal task from other queues")
         task = self.local_queues.pop_from_longest()
         if task is not None:
             return task
 
-        get_futures = [asyncio.create_task(func()) for func in self.queues_to_wait]
-        print("wait for task", flush=True)
-        done, _ = await asyncio.wait(get_futures, return_when=asyncio.FIRST_COMPLETED)
-
-        for task in get_futures:
+        self.queue_task = [asyncio.create_task(func()) for func in self.queues_to_wait]
+        logger.debug(f"wait for task from all queue, actor_meta: {self.actor_meta}")
+        done, _ = await asyncio.wait(self.queue_task, return_when=asyncio.FIRST_COMPLETED)
+        for task in self.queue_task:
             if not task.done():
                 task.cancel()
 
