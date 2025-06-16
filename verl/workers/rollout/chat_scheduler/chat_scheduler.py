@@ -292,12 +292,10 @@ class AsyncToolCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugi
 
         # STEP 3: send it back to local_queue
         new_rollout_req = RolloutReq(
-            completions=None,
             info=req.rollout_resp.info,
             messages=messages,
             model_name=req.rollout_resp.model_name,
             chat_complete_request=req.rollout_resp.chat_complete_request,
-            exceptoin=None,
         )
         req.actor_meta.queue_group.push(req.actor_meta.actor_id, new_rollout_req)
 
@@ -468,11 +466,12 @@ class ChatCompletionScheduler:
 
 
 class MicroBatchScheduler(ChatCompletionScheduler):
-    def __init__(self, config, server_addresses, max_cache_size=10000, max_inflight_req=8, rollout_req_handler=None, reduce_handler=None):
+    def __init__(self, config, server_addresses, max_cache_size=10000, max_inflight_req=8, rollout_req_handler=None, reduce_handler=None, enable_work_stealing=True):
         super().__init__(config, server_addresses, max_cache_size)
         self._validate_callback()
         self.max_inflight_req = max_inflight_req
         self.server_addresses = server_addresses
+        self.enable_work_stealing = enable_work_stealing
         self.number_of_servers = len(server_addresses)
         self.rollout_req_handler = rollout_req_handler if rollout_req_handler else self.default_handle_rollout_req
         self.reduce_handler = reduce_handler if reduce_handler else self.default_handle_reduce_req
@@ -512,7 +511,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
                     self.reduce_data_queue,
                     self.completion_callback,
                 )
-                actor = WorkStealingActor(worker_id=idx, local_id=counter, local_queues=self.local_data_queue_group, global_queue=self.global_data_queue, work_fn=work_fn)
+                actor = WorkStealingActor(worker_id=idx, local_id=counter, local_queues=self.local_data_queue_group, global_queue=self.global_data_queue, work_fn=work_fn, enable_work_stealing=self.enable_work_stealing)
                 actors.append(actor)
                 counter += 1
         print(f"[MicroBatchChatCompletionScheduler] init engine call actors done, total: {len(actors)}")
@@ -561,7 +560,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         if "content" not in message:
             message["content"] = ""
         messages.append(message)
-        resp = RolloutResp(completions=completions, exception=exception, messages=messages, model_name=rollout_req.model_name)
+        resp = RolloutResp(request=rollout_req, completions=completions, exception=exception, req_id=request_id, messages=messages)
         try:
             if external_call.hit(resp):
                 print(f"[id={completions.id},turn={len(messages)},finish_reason={completions.choices[0].finish_reason}] Call tools")
@@ -616,12 +615,12 @@ class MicroBatchScheduler(ChatCompletionScheduler):
 
             self.global_data_queue.put_nowait(
                 RolloutReq(
-                    completions=None,
                     messages=conversation.tolist(),
                     model_name=self.model_name,
                     sampling_params=kwargs,
                     tools_schema=self.completion_callback.tool_schemas,
                     extra_body=self.completion_callback.extra_body,
+                    verl_session_id=uuid4().hex,
                 )
             )
         print("[MicroBatchChatCompletionScheduler] generate_sequences start, with len(batch): ", len(batch))

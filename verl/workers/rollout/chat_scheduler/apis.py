@@ -11,7 +11,7 @@ from verl.workers.rollout.chat_scheduler.utils import ActorMeta
 
 @dataclass
 class RolloutReq:
-    completions: ChatCompletion
+    verl_session_id: Optional[str]
     model_name: str
     messages: List[Dict[str, str]]
     tools_schema: List[Dict[str, Any]]
@@ -21,11 +21,11 @@ class RolloutReq:
 
 @dataclass
 class RolloutResp:
+    request: RolloutReq
     completions: ChatCompletion
-    messages: List[Dict[str, str]]
     exception: Optional[Exception] = None
-    sampling_params: Dict[str, Any] = None
-    model_name: str = None
+    req_id: str = None
+    messages: List[Dict[str, str]] = None
 
 
 @dataclass
@@ -68,7 +68,7 @@ class CoroExternalCallsPlugin(AsyncCallbackMixin):
         self.coros = [asyncio.create_task(self.run()) for _ in range(self.num_workers)]
 
     def put(self, req: RolloutResp) -> bool:
-        self.plugin_queue.put(req)
+        self.plugin_queue.put_nowait(req)
 
     async def shutdown(self):
         self.shut_down_flag = True
@@ -92,4 +92,5 @@ class CoroExternalCallsPlugin(AsyncCallbackMixin):
             req: CallsReq = await self.plugin_queue.get()
             result = self(req)
             id = req.actor_meta.actor_id
+            assert isinstance(result, RolloutReq), "tools should "
             req.actor_meta.queue_group.push(id, result)

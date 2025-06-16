@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from functools import wraps
 from typing import Dict, List
@@ -11,7 +12,7 @@ from omegaconf import OmegaConf
 from openai.types.chat.chat_completion import ChatCompletion, ChatCompletionMessage, Choice
 
 from verl.protocol import DataProto
-from verl.workers.rollout.chat_scheduler.apis import CallsReq, CoroExternalCallsPlugin
+from verl.workers.rollout.chat_scheduler.apis import CallsReq, CoroExternalCallsPlugin, RolloutReq, RolloutResp
 from verl.workers.rollout.chat_scheduler.chat_scheduler import MicroBatchScheduler, ToolCompletionCallback
 
 do_bench = True
@@ -29,20 +30,54 @@ def skip_if_false(exp):
     return decorator
 
 
-class MyCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugin):
+class NoHitCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugin):
     def __init__(self, config, scheduler):
         ToolCompletionCallback.__init__(self, config, scheduler)
         CoroExternalCallsPlugin.__init__(self, num_workers=2)
-        print("init MyCompletionCallback")
+        self.req_counter = {}
 
-    def hit(self, req):
+    def hit(self, req: CallsReq):
         return False
 
     def __call__(self, req: CallsReq):
-        return req
+        raise ValueError("NoHitCompletionCallback")
 
     def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int):
         return batch_conversations
+
+
+class ThirdTurnCallback(NoHitCompletionCallback):
+    def hit(self, req: RolloutResp):
+        session_id = req.request.verl_session_id
+        if session_id not in self.req_counter.keys():
+            self.req_counter[session_id] = 1
+            return True
+        else:
+            self.req_counter[session_id] += 1
+            if self.req_counter[session_id] > 3:
+                return False
+            else:
+                return True
+
+    def __call__(self, req):
+        msg = req.rollout_resp.request.messages
+        resp_str = json.dumps(
+            {
+                "local_id": req.actor_meta.local_id,
+                "actor_id": req.actor_meta.actor_id,
+                "turns": self.req_counter[req.rollout_resp.request.verl_session_id],
+            },
+        )
+        msg.append(ChatCompletionMessage(role="assistant", content=resp_str))
+        rollout_req = RolloutReq(
+            verl_session_id=req.rollout_resp.request.verl_session_id,
+            model_name=req.rollout_resp.request.model_name,
+            sampling_params=req.rollout_resp.request.sampling_params,
+            tools_schema=req.rollout_resp.request.tools_schema,
+            extra_body=req.rollout_resp.request.extra_body,
+            messages=msg,
+        )
+        return rollout_req
 
 
 class TestMicroBatchScheduler:
@@ -129,15 +164,55 @@ class TestMicroBatchScheduler:
             config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
             config.actor_rollout_ref.model.path = small_model_path
             config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
-            config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.MyCompletionCallback"
+            config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.NoHitCompletionCallback"
             prompts, _ = aime_dataset[0], aime_dataset[1]
             print("length of data proto : ", len(prompts))
             # Init sandbox and async rollout manager
-            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2)
+            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2, enable_work_stealing=False)
 
             re = await scheduler.generate_sequences(batch=prompts)
             assert len(re) == len(prompts), "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
             await scheduler.shut_down_actors()
+
+        loop.run_until_complete(run_test())
+        loop.stop()
+        loop.close()
+
+    @patch("verl.workers.rollout.chat_scheduler.requests.chat_completions_aiohttp", new_callable=AsyncMock)
+    def test_local_queue_put(self, mock_chat_completions_aiohttp: AsyncMock, ray_env, aime_dataset, small_model_path, chat_completion):
+        os.environ["VERL_QUEUE_LOGGING_LEVEL"] = "INFO"
+        os.environ["VERL_LOGGING_LEVEL"] = "DEBUG"
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def run_test():
+            # Load config
+            mock_chat_completions_aiohttp.return_value = chat_completion
+            config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
+            config.actor_rollout_ref.model.path = small_model_path
+            config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
+            config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.ThirdTurnCallback"
+            prompts, _ = aime_dataset[0], aime_dataset[1]
+            print("length of data proto : ", len(prompts))
+            # Init sandbox and async rollout manager
+            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2, enable_work_stealing=False)
+
+            re = await scheduler.generate_sequences(batch=prompts)
+            assert len(re) == len(prompts), "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
+            await scheduler.shut_down_actors()
+            actor_id_count = {}
+            for sample in re:
+                print(sample)
+                assert len(sample) == 2 + 2 * 3, len(sample)
+                turns_msg = [json.loads(sample[2].content), json.loads(sample[4].content), json.loads(sample[6].content)]
+                actor_id = turns_msg[0]["actor_id"]
+                if actor_id not in actor_id_count:
+                    actor_id_count[actor_id] = 0
+                actor_id_count[actor_id] += 1
+                for real_id in turns_msg:
+                    assert real_id["actor_id"] == actor_id, f"local queue mismatch: {real_id}, {actor_id}"
+            values = actor_id_count.values()
+            assert len(values) == 4, "actor id count is not equal to 4"
 
         loop.run_until_complete(run_test())
         loop.stop()

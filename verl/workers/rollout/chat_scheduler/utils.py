@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from typing import Any, List, Protocol
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_QUEUE_LOGGING_LEVEL", "DEBUG"))
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_QUEUE_LOGGING_LEVEL", "INFO"))
 
 
 # copyed from http://code.activestate.com/recipes/522995-priority-dict-a-priority-queue-with-updatable-prio/
@@ -108,7 +108,7 @@ class QueueGroup:
     def __len__(self):
         return len(self._queues)
 
-    async def push(self, idx: int, item: Any):
+    def push(self, idx: int, item: Any):
         # we don't need lock here, because we are using a single thread
         self._queues[idx].put_nowait(item)
         # this heap return the smallest value, so we need to minus 1
@@ -162,14 +162,7 @@ class WorkFunc(Protocol):
 
 
 class WorkStealingActor:
-    def __init__(
-        self,
-        worker_id: int,
-        local_id: int,
-        local_queues: QueueGroup,
-        global_queue: asyncio.Queue,
-        work_fn: WorkFunc,
-    ):
+    def __init__(self, worker_id: int, local_id: int, local_queues: QueueGroup, global_queue: asyncio.Queue, work_fn: WorkFunc, enable_work_stealing: bool = True):
         self.worker_id = worker_id
         self.local_id = local_id
         self.local_queues = local_queues
@@ -177,6 +170,7 @@ class WorkStealingActor:
         self.func = work_fn
         self.total_workers = len(local_queues)
         self.actor_meta = ActorMeta(worker_id, self.local_queues, self.local_id)
+        self.enable_work_stealing = enable_work_stealing
         self.queues_to_wait = self._build_priority_queue_list()
         self.coro = self._init_actor_coro()
         self.cur_task = None
@@ -186,7 +180,11 @@ class WorkStealingActor:
         self.shutdown_done = asyncio.Event()
 
     def _build_priority_queue_list(self):
-        return [functools.partial(self.local_queues.pop, self.worker_id), self.global_queue.get] + [functools.partial(self.local_queues.pop, i) for i, _ in enumerate(self.local_queues) if i != self.worker_id]
+        base_queue = [functools.partial(self.local_queues.pop, self.worker_id), self.global_queue.get]
+        if self.enable_work_stealing:
+            return base_queue + [functools.partial(self.local_queues.pop, i) for i, _ in enumerate(self.local_queues) if i != self.worker_id]
+        else:
+            return base_queue
 
     async def run(self):
         print("start worker for actor, actor_meta: ", self.actor_meta, flush=True)
@@ -261,10 +259,11 @@ class WorkStealingActor:
             return self.global_queue.get_nowait()
         except asyncio.QueueEmpty:
             pass
-        logger.debug("try to steal task from other queues")
-        task = self.local_queues.pop_from_longest()
-        if task is not None:
-            return task
+        if self.enable_work_stealing:
+            logger.debug("try to steal task from other queues")
+            task = self.local_queues.pop_from_longest()
+            if task is not None:
+                return task
 
         self.queue_task = [asyncio.create_task(func()) for func in self.queues_to_wait]
         logger.debug(f"wait for task from all queue, actor_meta: {self.actor_meta}")
