@@ -191,7 +191,7 @@ class WorkStealingActor:
         while not self.shutdown_flag:
             try:
                 task = await self.get_task()
-                logger.debug(f"get task {task} from queue, actor_meta: {self.actor_meta}")
+                print(f"get task {task} from queue, actor_meta: {self.actor_meta}")
                 coros = self.func(self.actor_meta, task)
                 self.cur_task: asyncio.Task = asyncio.ensure_future(coros)
                 await self.cur_task
@@ -210,23 +210,24 @@ class WorkStealingActor:
     def _init_actor_coro(self):
         self.coro = asyncio.create_task(self.run())
 
-    async def cancel_task(self):
+    def cancel_task(self):
+        evt = asyncio.Event()
         if self.cur_task is not None and (self.cur_task.done() or self.cur_task.cancelled()):
-            evt = asyncio.Event()
             self.cur_task.add_done_callback(functools.partial(self._set_evt, evt=evt))
-            print(self.cur_task.print_stack())
             self.cur_task.cancel()
-            await evt.wait()
+        else:
+            evt.set()
         # set blocker
         self.blocker.clear()
+        return evt
 
     def wakeup(self):
         self.blocker.set()
         print("wakeup worker skipped, because worker is not blocked", flush=True)
 
     def _set_evt(self, task, evt: asyncio.Event):
-        print(task, evt)
         evt.set()
+        # print(task, evt)
 
     async def shutdown(self):
         print("ready to shut down actor: ", self.actor_meta, flush=True)
@@ -235,6 +236,7 @@ class WorkStealingActor:
         task_to_cancel = self.queue_task
         task_to_cancel.append(self.coro)
         if self.cur_task is not None:
+            print("append cur task to cancel")
             task_to_cancel.append(self.cur_task)
         for task in task_to_cancel:
             if task is not None and (not task.done() or not task.cancelled()):

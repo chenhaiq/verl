@@ -34,6 +34,10 @@ async def chat_completions_aiohttp(address: str, **chat_complete_request) -> Cha
         await session.close()
 
 
+async def abort_chat_completions_aiohttp(address: str, request_id) -> ChatCompletion:
+    pass
+
+
 async def chat_completions_openai(address: str, api_key: str = "token-abc123", **chat_complete_request) -> ChatCompletion:
     client = AsyncOpenAI(base_url=f"http://{address}/v1", api_key=api_key, timeout=None, max_retries=0)
     return await client.chat.completions.create(**chat_complete_request)

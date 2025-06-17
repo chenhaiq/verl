@@ -166,7 +166,6 @@ class TestMicroBatchScheduler:
             config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
             config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.NoHitCompletionCallback"
             prompts, _ = aime_dataset[0], aime_dataset[1]
-            print("length of data proto : ", len(prompts))
             # Init sandbox and async rollout manager
             scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2, enable_work_stealing=False)
 
@@ -210,9 +209,66 @@ class TestMicroBatchScheduler:
                     actor_id_count[actor_id] = 0
                 actor_id_count[actor_id] += 1
                 for real_id in turns_msg:
+                    # this means pipeline stealing not working,which is expected
+                    # and the actor id should be the same for verifying the affinity of req to local queue.
                     assert real_id["actor_id"] == actor_id, f"local queue mismatch: {real_id}, {actor_id}"
-            values = actor_id_count.values()
-            assert len(values) == 4, "actor id count is not equal to 4"
+
+        loop.run_until_complete(run_test())
+        loop.stop()
+        loop.close()
+
+    @patch("verl.workers.rollout.chat_scheduler.requests.chat_completions_aiohttp", new_callable=AsyncMock)
+    def test_partial_rollout_cancel_and_resume(self, mock_chat_completions_aiohttp: AsyncMock, ray_env, aime_dataset, small_model_path, chat_completion):
+        os.environ["VERL_QUEUE_LOGGING_LEVEL"] = "INFO"
+        os.environ["VERL_LOGGING_LEVEL"] = "DEBUG"
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def run_test():
+            # Load config
+            mock_chat_completions_aiohttp.return_value = chat_completion
+            config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
+            config.actor_rollout_ref.model.path = small_model_path
+            config.actor_rollout_ref.rollout.chat_scheduler.name = "micro_batch_scheduler"
+            config.actor_rollout_ref.rollout.multi_turn.completion_callback = "tests.workers.rollout.test_vllm_micro_batch_scheduler.ThirdTurnCallback"
+            prompts, _ = aime_dataset[0], aime_dataset[1]
+            print("length of data proto : ", len(prompts))
+            # Init sandbox and async rollout manager
+            scheduler = MicroBatchScheduler(config, server_addresses=[1, 2, 3, 4], max_inflight_req=2, enable_work_stealing=False, rollout_rate=0.9)
+            expect_length = int(len(prompts) * 0.9)
+            re = await scheduler.generate_sequences(batch=prompts)
+            assert len(re) == expect_length, "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
+            # right now all actor should be in block state and no task.
+            for actor in scheduler.engine_call_actors:
+                assert not actor.blocker.is_set()
+                assert actor.cur_task is None
+            scheduler.set_rollout_rate(1)
+            re = await scheduler.generate_sequences(batch=prompts)
+            assert len(re) == len(prompts), "length of re is not equal to length of prompts,re is {} and prompts is {}".format(len(re), len(prompts))
+            await scheduler.shut_down_actors()
+            actor_id_count = {}
+            local_id_count = {}
+            for sample in re:
+                print(sample)
+                assert len(sample) == 2 + 2 * 3, len(sample)
+                turns_msg = [json.loads(sample[2].content), json.loads(sample[4].content), json.loads(sample[6].content)]
+                actor_id = turns_msg[0]["actor_id"]
+                if actor_id not in actor_id_count:
+                    actor_id_count[actor_id] = 0
+                local_id = turns_msg[0]["local_id"]
+                if local_id not in local_id_count:
+                    local_id_count[local_id] = 0
+                actor_id_count[actor_id] += 1
+                local_id_count[local_id] += 1
+                for real_id in turns_msg:
+                    # this means pipeline stealing not working,which is expected
+                    # and the actor id should be the same for verifying the affinity of req to local queue.
+                    assert real_id["actor_id"] == actor_id, f"local queue mismatch: {real_id}, {actor_id}"
+            # this verify none of actor dead.
+            print(actor_id_count)
+            print(local_id_count)
+            assert len(local_id_count) == 8, "local id count is not equal to 4, local_id_count is {}".format(local_id_count)
+            assert len(actor_id_count) == 4, "actor id count is not equal to 4, actor_id_count is {}".format(actor_id_count)
 
         loop.run_until_complete(run_test())
         loop.stop()

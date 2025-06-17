@@ -19,7 +19,6 @@ import itertools
 import json
 import logging
 import os
-import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -30,6 +29,7 @@ from cachetools import LRUCache
 from omegaconf import DictConfig
 from openai.types.chat.chat_completion import ChatCompletion
 from tensordict import TensorDict
+from transformers import PreTrainedTokenizer
 
 from verl.protocol import DataProto
 from verl.tools.base_tool import initialize_tools_from_config
@@ -38,7 +38,7 @@ from verl.utils.tokenizer import hf_tokenizer
 from verl.workers.rollout.chat_scheduler.apis import AsyncCallbackMixin, CallsReq, CoroExternalCallsPlugin, RolloutReq, RolloutResp
 from verl.workers.rollout.chat_scheduler.utils import ActorMeta, QueueGroup, WorkStealingActor
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -56,7 +56,7 @@ class CompletionCallback(ABC):
         print(f"Initialized tools: {self.tools}", flush=True)
 
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+        self.tokenizer: PreTrainedTokenizer = hf_tokenizer(local_path, trust_remote_code=True)
 
     @property
     def tool_schemas(self):
@@ -466,29 +466,34 @@ class ChatCompletionScheduler:
 
 
 class MicroBatchScheduler(ChatCompletionScheduler):
-    def __init__(self, config, server_addresses, max_cache_size=10000, max_inflight_req=8, rollout_req_handler=None, reduce_handler=None, enable_work_stealing=True):
+    def __init__(self, config, server_addresses, max_cache_size=10000, rollout_rate=1, max_inflight_req=8, rollout_req_handler=None, reduce_handler=None, enable_work_stealing=True):
         super().__init__(config, server_addresses, max_cache_size)
         self._validate_callback()
         self.max_inflight_req = max_inflight_req
         self.server_addresses = server_addresses
         self.enable_work_stealing = enable_work_stealing
         self.number_of_servers = len(server_addresses)
+        self.rollout_rate = rollout_rate
         self.rollout_req_handler = rollout_req_handler if rollout_req_handler else self.default_handle_rollout_req
         self.reduce_handler = reduce_handler if reduce_handler else self.default_handle_reduce_req
         self._init_global_resource()
+        # TODO better implement a supervisor-tree pattern, include dead-letter-queue to monitor whether any actor exit unexpectly
         self.engine_call_actors: List[WorkStealingActor] = self._init_engine_call_actors(server_address=server_addresses, max_inflight_req=max_inflight_req)
         self.wake_up_engine_actor()
+
+    def set_rollout_rate(self, rate):
+        assert rate <= 1 and rate > 0, "rollout rate must be in (0, 1]"
+        self.rollout_rate = rate
+
+    def _get_rollout_batch_size(self, data_batch_size):
+        return int(data_batch_size * self.rollout_rate)
 
     def _validate_callback(self):
         if self.completion_callback is None:
             raise ValueError("completion_callback is None")
         if not isinstance(self.completion_callback, AsyncCallbackMixin):
             raise ValueError("completion_callback mixin AsyncCallbackMixin")
-        print(f"completion_callback: {self.completion_callback}")
-
-    def _init_reduce_thread(self):
-        self.reduce_thread = threading.Thread(target=self.handle_reduce_req, args=(self.reduce_data_queue,), daemon=True, name="reduce_data_thread")
-        self.reduce_thread.start()
+        logger.error(f"completion_callback: {self.completion_callback}")
 
     def _init_global_resource(self):
         self.loop = asyncio.get_event_loop()
@@ -518,8 +523,13 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         return actors
 
     async def cancel_all_req(self):
+        evts = []
         for actor in self.engine_call_actors:
-            await actor.cancel_task()
+            maybe_set_evt: asyncio.Event = actor.cancel_task()
+            if not maybe_set_evt.is_set():
+                evts.append(maybe_set_evt.wait())
+        print(f"cancel req with length: {len(evts)}")
+        await asyncio.gather(*evts)
 
     def wake_up_engine_actor(self):
         for actor in self.engine_call_actors:
@@ -589,9 +599,10 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             batch_conversations[counter] = sample.messages
             counter += 1
         print("[MicroBatchChatCompletionScheduler] _gather_result done for one batch")
-        return batch_conversations
+        return batch_conversations  # -》 当前要训的+不要训的/部分完成的。
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
+        self.wake_up_engine_actor()
         kwargs = dict(
             model=self.model_name,
             temperature=self.config.temperature,
@@ -624,6 +635,8 @@ class MicroBatchScheduler(ChatCompletionScheduler):
                 )
             )
         print("[MicroBatchChatCompletionScheduler] generate_sequences start, with len(batch): ", len(batch))
-        batch_conversations = await self.reduce_handler(len(batch))
-        logger.info("[MicroBatchChatCompletionScheduler] generate_sequences done")
+        batch_conversations = await self.reduce_handler(self._get_rollout_batch_size(len(batch)))
+        print(f"partial rollout done, cancel all left request, real size: {len(batch_conversations)}")
+        await self.cancel_all_req()
+        print("[MicroBatchChatCompletionScheduler] generate_sequences done")
         return self.completion_callback.postprocess(batch, batch_conversations, n=n)
