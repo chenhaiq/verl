@@ -496,6 +496,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         logger.error(f"completion_callback: {self.completion_callback}")
 
     def _init_global_resource(self):
+        # TODO use ZMQ to implement pub-sub for debug purpose
         self.loop = asyncio.get_event_loop()
         self.global_data_queue = asyncio.Queue()
         self.local_data_queue_group = QueueGroup(self.number_of_servers, [asyncio.Queue() for _ in range(self.number_of_servers)])

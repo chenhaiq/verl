@@ -178,6 +178,7 @@ class WorkStealingActor:
         self.blocker: asyncio.Event = asyncio.Event()
         self.shutdown_flag = False
         self.shutdown_done = asyncio.Event()
+        self.wakeup()
 
     def _build_priority_queue_list(self):
         base_queue = [functools.partial(self.local_queues.pop, self.worker_id), self.global_queue.get]
@@ -187,25 +188,25 @@ class WorkStealingActor:
             return base_queue
 
     async def run(self):
-        print("start worker for actor, actor_meta: ", self.actor_meta, flush=True)
+        logger.info("start worker for actor, actor_meta: ", self.actor_meta)
         while not self.shutdown_flag:
             try:
                 task = await self.get_task()
-                print(f"get task {task} from queue, actor_meta: {self.actor_meta}")
+                logger.debug(f"get task {task} from queue, actor_meta: {self.actor_meta}")
                 coros = self.func(self.actor_meta, task)
                 self.cur_task: asyncio.Task = asyncio.ensure_future(coros)
                 await self.cur_task
             except asyncio.CancelledError:
                 # this means the work function didn't hanlde the canceled error
                 # we need to cancel the task
-                print(f"cancel task {task}, actor_meta: {self.actor_meta}", flush=True)
+                logger.debug(f"cancel task {task}, actor_meta: {self.actor_meta}")
             except Exception as e:
-                print(f"Fatal Error: task {task} failed, actor_meta: {self.actor_meta}, error: {e}", flush=True)
+                logger.warning(f"Fatal Error: task {task} failed, actor_meta: {self.actor_meta}, error: {e}")
             finally:
                 self.cur_task = None
-                print(f"finish task, actor_meta: {self.actor_meta}", flush=True)
+                logger.debug(f"finish task, actor_meta: {self.actor_meta}")
         self.shutdown_done.set()
-        print(f"shutdown done with actor meta: {self.actor_meta}", flush=True)
+        logger.info(f"shutdown done with actor meta: {self.actor_meta}")
 
     def _init_actor_coro(self):
         self.coro = asyncio.create_task(self.run())
@@ -223,20 +224,18 @@ class WorkStealingActor:
 
     def wakeup(self):
         self.blocker.set()
-        print("wakeup worker skipped, because worker is not blocked", flush=True)
 
     def _set_evt(self, task, evt: asyncio.Event):
         evt.set()
-        # print(task, evt)
 
     async def shutdown(self):
-        print("ready to shut down actor: ", self.actor_meta, flush=True)
+        logger.info(f"ready to shut down actor: {self.actor_meta}")
         self.shutdown_flag = True
         event = []
         task_to_cancel = self.queue_task
         task_to_cancel.append(self.coro)
         if self.cur_task is not None:
-            print("append cur task to cancel")
+            logger.info(f"append cur task to cancel: {self.cur_task}")
             task_to_cancel.append(self.cur_task)
         for task in task_to_cancel:
             if task is not None and (not task.done() or not task.cancelled()):
