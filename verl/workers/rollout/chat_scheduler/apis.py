@@ -3,20 +3,24 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+import numpy as np
 from openai.types.chat.chat_completion import ChatCompletion
 
-from verl.protocol import DataProto
 from verl.workers.rollout.chat_scheduler.utils import ActorMeta
 
 
 @dataclass
 class RolloutReq:
+    # this works for tool-calling, indicate for one-multi-turns request
     verl_session_id: Optional[str]
+    # sample_id
+    sample_id: Optional[str]
     model_name: str
     messages: List[Dict[str, str]]
     tools_schema: List[Dict[str, Any]]
     sampling_params: Dict[str, Any]
     extra_body: Dict[str, Any]
+    raw_prompt: np.ndarray
 
 
 @dataclass
@@ -36,8 +40,8 @@ class CallsReq:
 
 @dataclass
 class ReduceResp:
-    batch: DataProto
-    batch_conversations: List[List[Dict[str, str]]]
+    raw_prompt: np.ndarray
+    messages: List[List[Dict[str, str]]]
 
 
 @runtime_checkable
@@ -56,16 +60,28 @@ class AsyncCallbackMixin(Protocol):
 
 
 class CoroExternalCallsPlugin(AsyncCallbackMixin):
-    def __init__(self, num_workers=3):
+    def __init__(self, num_workers=3, death_letter: Optional[asyncio.Queue] = None):
         self.plugin_queue = asyncio.Queue()
         self.num_workers = num_workers
-        self._init_plugin_callers()
         self.shut_down_flag = False
         self.shutdown_evt = asyncio.Event()
+        self.death_letter: Optional[asyncio.Queue] = death_letter
 
-    def _init_plugin_callers(self):
-        print("init plugin callers for CoroExternalCallsPlugin with worker: ", self.num_workers)
-        self.coros = [asyncio.create_task(self.run()) for _ in range(self.num_workers)]
+    def init_plugin_callers(self):
+        if self.death_letter is not None:
+            pass
+            # def callback(task):
+            #     if task.exception() is not None:
+            #         letter = DeathLetter(
+            #             actor_meta=self.actor_meta,
+            #             async_task=task,
+            #         )
+            #         self.death_letter.put_nowait(letter)
+            # self.coro = asyncio.create_task(self.run())
+            # self.coro.add_done_callback(callback)
+        else:
+            print("init plugin callers for CoroExternalCallsPlugin with worker: ", self.num_workers)
+            self.coros = [asyncio.create_task(self.run()) for _ in range(self.num_workers)]
 
     def put(self, req: RolloutResp) -> bool:
         self.plugin_queue.put_nowait(req)

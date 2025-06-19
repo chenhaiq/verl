@@ -22,15 +22,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.metrics.loggers import (
-    LoggingStatLogger,
-    PrometheusStatLogger,
-)
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl.utils.fs import copy_to_local
@@ -180,7 +177,6 @@ class AsyncvLLMServer(AsyncServerBase):
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
-            disable_log_stats=config.get("disable_log_stats", False),
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
@@ -193,7 +189,7 @@ class AsyncvLLMServer(AsyncServerBase):
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
         # this will override vllm_config for logging
-        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_stats=config.get("disable_log_stats", False), stat_loggers=[PrometheusStatLogger, LoggingStatLogger])
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_stats=config.get("disable_log_stats", False))
 
         # build serving chat
         model_config = self.engine.model_config
@@ -204,8 +200,8 @@ class AsyncvLLMServer(AsyncServerBase):
             model_config,
             models,
             "assistant",
-            # request_logger=RequestLogger(max_log_len=4096),
-            request_logger=None,
+            request_logger=RequestLogger(max_log_len=4096),
+            # request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
             enable_auto_tools=True,

@@ -441,7 +441,14 @@ actor_rollout_ref:
       completion_callback: null
 
     chat_scheduler:
+    
       name: null
+
+      micro_batch:
+
+        max_inflight_req: null
+
+        enable_work_stealing: False
 
 # configs for the critic
 critic:

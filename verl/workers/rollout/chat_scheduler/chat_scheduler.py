@@ -35,10 +35,10 @@ from verl.protocol import DataProto
 from verl.tools.base_tool import initialize_tools_from_config
 from verl.utils.fs import copy_to_local
 from verl.utils.tokenizer import hf_tokenizer
-from verl.workers.rollout.chat_scheduler.apis import AsyncCallbackMixin, CallsReq, CoroExternalCallsPlugin, RolloutReq, RolloutResp
+from verl.workers.rollout.chat_scheduler.apis import AsyncCallbackMixin, CallsReq, CoroExternalCallsPlugin, ReduceResp, RolloutReq, RolloutResp
 from verl.workers.rollout.chat_scheduler.utils import ActorMeta, QueueGroup, WorkStealingActor
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -299,6 +299,60 @@ class AsyncToolCompletionCallback(ToolCompletionCallback, CoroExternalCallsPlugi
         )
         req.actor_meta.queue_group.push(req.actor_meta.actor_id, new_rollout_req)
 
+    def postprocess(self, batch, batch_conversations, n):
+        data_proto = super().postprocess(batch, batch_conversations, n)
+        return data_proto
+
+    def new_postprocess(self, batch_conversations: List[ReduceResp], n):
+        # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
+        # prompts: left pad
+        # responses: right pad
+        # input_ids: prompt + response
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+
+        raw_prompts = np.array([resp.raw_prompt for resp in batch_conversations], dtype=object)
+
+        raw_messages = [message for resp in batch_conversations for message in resp.messages]
+        # prompts: [prompt] from input dataset
+        prompts = [self.tokenizer.apply_chat_template(resp.raw_prompt, tools=self.tool_schemas, add_generation_prompt=True, tokenize=False) for resp in batch_conversations]
+
+        # sequences: [prompt + response]
+
+        sequences = [self.tokenizer.apply_chat_template(message, tools=self.tool_schemas, add_generation_prompt=False, tokenize=False) for resp in batch_conversations for message in resp.messages]
+
+        assert len(sequences) == len(prompts) * n
+        # responses: [response]
+        responses = [sequence[len(prompts[i // n]) :] for i, sequence in enumerate(sequences)]
+
+        prompts = self.tokenizer(prompts, return_tensors="pt", padding="longest", padding_side="left")
+        responses = self.tokenizer(responses, return_tensors="pt", padding="longest", padding_side="right")
+        if n > 1:
+            prompts["input_ids"] = prompts["input_ids"].repeat_interleave(n, dim=0)
+            prompts["attention_mask"] = prompts["attention_mask"].repeat_interleave(n, dim=0)
+
+        # response_mask: response mask with tools calling masked out
+        response_mask = self._mask_out_tools_calling_tokens(raw_prompts.repeat(n, axis=0), raw_messages, responses["input_ids"], responses["attention_mask"])
+
+        input_ids = torch.cat([prompts["input_ids"], responses["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
+        position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
+
+        batch = TensorDict(
+            {
+                "prompts": prompts["input_ids"],  # [bsz, prompt_length]
+                "responses": responses["input_ids"],  # [bsz, response_length]
+                "response_mask": response_mask,  # [bsz, response_length]
+                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
+                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                "position_ids": position_ids,  # [bsz, prompt_length + response_length]
+            },
+            batch_size=len(input_ids),
+        )
+
+        num_turns = np.array([len(conversation) for conversation in raw_messages], dtype=np.int32)
+        return DataProto(batch=batch, non_tensor_batch={"__num_turns__": num_turns})
+
 
 class ChatCompletionScheduler:
     def __init__(
@@ -468,18 +522,18 @@ class ChatCompletionScheduler:
 class MicroBatchScheduler(ChatCompletionScheduler):
     def __init__(self, config, server_addresses, max_cache_size=10000, rollout_rate=1, max_inflight_req=8, rollout_req_handler=None, reduce_handler=None, enable_work_stealing=True):
         super().__init__(config, server_addresses, max_cache_size)
+        self.mirco_batch_config = config.actor_rollout_ref.rollout.chat_scheduler
+        print(self.config)
         self._validate_callback()
-        self.max_inflight_req = max_inflight_req
+        self.max_inflight_req = self.mirco_batch_config.micro_batch.max_inflight_req if self.mirco_batch_config.micro_batch.max_inflight_req else max_inflight_req
         self.server_addresses = server_addresses
-        self.enable_work_stealing = enable_work_stealing
+        self.enable_work_stealing = self.mirco_batch_config.micro_batch.enable_work_stealing if self.mirco_batch_config.micro_batch.enable_work_stealing else enable_work_stealing
         self.number_of_servers = len(server_addresses)
         self.rollout_rate = rollout_rate
         self.rollout_req_handler = rollout_req_handler if rollout_req_handler else self.default_handle_rollout_req
         self.reduce_handler = reduce_handler if reduce_handler else self.default_handle_reduce_req
-        self._init_global_resource()
-        # TODO better implement a supervisor-tree pattern, include dead-letter-queue to monitor whether any actor exit unexpectly
-        self.engine_call_actors: List[WorkStealingActor] = self._init_engine_call_actors(server_address=server_addresses, max_inflight_req=max_inflight_req)
-        self.wake_up_engine_actor()
+        self.initialized = False
+        self.reduce_format = "ReduceResp"
 
     def set_rollout_rate(self, rate):
         assert rate <= 1 and rate > 0, "rollout rate must be in (0, 1]"
@@ -495,12 +549,31 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             raise ValueError("completion_callback mixin AsyncCallbackMixin")
         logger.error(f"completion_callback: {self.completion_callback}")
 
-    def _init_global_resource(self):
+    def _lazy_init_global_resource(self):
+        if self.initialized:
+            return
+        else:
+            self.initialized = True
         # TODO use ZMQ to implement pub-sub for debug purpose
         self.loop = asyncio.get_event_loop()
+        self.death_letter = asyncio.Queue()
         self.global_data_queue = asyncio.Queue()
         self.local_data_queue_group = QueueGroup(self.number_of_servers, [asyncio.Queue() for _ in range(self.number_of_servers)])
         self.reduce_data_queue = asyncio.Queue()
+        # TODO better implement a supervisor-tree pattern, include dead-letter-queue to monitor whether any actor exit unexpectly
+        self.engine_call_actors: List[WorkStealingActor] = self._init_engine_call_actors(server_address=self.server_addresses, max_inflight_req=self.max_inflight_req)
+        self.wake_up_engine_actor()
+        self.completion_callback.init_plugin_callers()
+        self._init_death_letter_consumer()
+        logger.info(f"start MicroBatchChatCompletionScheduler, with max_inflight_req: {self.max_inflight_req}, enable_work_stealing: {self.enable_work_stealing}, server_address: {self.server_addresses}")
+
+    def _init_death_letter_consumer(self):
+        async def consume_death_letter():
+            while True:
+                letter = await self.death_letter.get()
+                print(f"[MicroBatchChatCompletionScheduler] consume death letter: {letter}")
+
+        asyncio.create_task(consume_death_letter())
 
     def _init_engine_call_actors(self, server_address, max_inflight_req):
         # we use a group of coroutine to consume send_queue and produce reduce_queue
@@ -517,7 +590,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
                     self.reduce_data_queue,
                     self.completion_callback,
                 )
-                actor = WorkStealingActor(worker_id=idx, local_id=counter, local_queues=self.local_data_queue_group, global_queue=self.global_data_queue, work_fn=work_fn, enable_work_stealing=self.enable_work_stealing)
+                actor = WorkStealingActor(worker_id=idx, local_id=counter, local_queues=self.local_data_queue_group, global_queue=self.global_data_queue, work_fn=work_fn, enable_work_stealing=self.enable_work_stealing, death_letter=self.death_letter)
                 actors.append(actor)
                 counter += 1
         print(f"[MicroBatchChatCompletionScheduler] init engine call actors done, total: {len(actors)}")
@@ -548,7 +621,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
     async def default_handle_rollout_req(self, addr, reduce_queue: asyncio.Queue, external_call: AsyncCallbackMixin, actor_meta: ActorMeta, rollout_req: RolloutReq):
         from verl.workers.rollout.chat_scheduler.requests import chat_completions_aiohttp
 
-        print(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, addr: {addr}, actor_meta: {actor_meta}")
+        logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process get sample, addr: {addr}, actor_meta: {actor_meta}")
         request_id = uuid4().hex
         completions, exception, message = None, None, {}
         messages = rollout_req.messages
@@ -565,29 +638,32 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             )
             message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
         except Exception as e:
-            print(f"chat completion failed with exception: {e}")
+            logger.warning(f"chat completion failed with exception: {e}")
             exception = e
-        print(f"[MicroBatchChatCompletionScheduler] _consumer process get sample done,meesage: {message}", actor_meta)
+        logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process get sample done,meesage: {message}", actor_meta)
         if "content" not in message:
             message["content"] = ""
         messages.append(message)
         resp = RolloutResp(request=rollout_req, completions=completions, exception=exception, req_id=request_id, messages=messages)
         try:
             if external_call.hit(resp):
-                print(f"[id={completions.id},turn={len(messages)},finish_reason={completions.choices[0].finish_reason}] Call tools")
+                logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={completions.choices[0].finish_reason}] Call tools")
                 external_call.put(CallsReq(rollout_resp=resp, actor_meta=actor_meta))
             else:
-                print(f"[MicroBatchChatCompletionScheduler] _consumer process put sample to reduce_queue,idx: {actor_meta.actor_id}")
+                logger.debug(f"[MicroBatchChatCompletionScheduler] _consumer process put sample to reduce_queue,idx: {actor_meta.actor_id}")
                 reduce_queue.put_nowait(resp)
         except Exception as e:
-            print(f"[MicroBatchChatCompletionScheduler] _consumer process put sample to reduce_queue failed,idx: {actor_meta.actor_id}, exception: {e}")
+            logger.warning(f"[MicroBatchChatCompletionScheduler] _consumer process put sample to reduce_queue failed,idx: {actor_meta.actor_id}, exception: {e}")
             resp.exception = e
             reduce_queue.put_nowait(resp)
         print("[MicroBatchChatCompletionScheduler] _consumer process done")
 
     # maybe we can make this sink_queue as a pubsub proxy using zmq
-    async def default_handle_reduce_req(self, batch_size, sink_queue: asyncio.Queue = None):
-        batch_conversations = [None] * batch_size
+    async def default_handle_reduce_req(self, batch_size, n_sample, sink_queue: asyncio.Queue = None, format="ReduceResp"):
+        batch_conversations = []
+        # joiner_buffer worked as key for raw_prompt,value for result.
+        # make sure n-sample arrived correctlly then ship to batch_conversations as result
+        joiner_buffer: Dict[str, List[List[Dict[str, str]]]] = {}
         counter = 0
         while counter < batch_size:
             print(f"[MicroBatchChatCompletionScheduler] _gather_result counter: {counter}")
@@ -597,12 +673,26 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             if sample.exception is not None:
                 # assert exception is None, f"exception: {exception}"
                 raise sample.exception
-            batch_conversations[counter] = sample.messages
-            counter += 1
+            sample_id = sample.request.sample_id
+            if sample_id in joiner_buffer.keys():
+                joiner_buffer[sample_id].append(sample.messages)
+            else:
+                joiner_buffer[sample_id] = [sample.messages]
+            if len(joiner_buffer[sample_id]) == n_sample:
+                if format == "ReduceResp":
+                    logger.debug(f"finished for samples: {sample_id}")
+                    batch_conversations.append(ReduceResp(raw_prompt=sample.request.raw_prompt, messages=joiner_buffer[sample_id]))
+                else:
+                    batch_conversations.extend(joiner_buffer[sample_id])
+                counter += 1
         print("[MicroBatchChatCompletionScheduler] _gather_result done for one batch")
-        return batch_conversations  # -》 当前要训的+不要训的/部分完成的。
+        return batch_conversations
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
+    async def hit_stop_terms(self):
+        pass
+
+    async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+        self._lazy_init_global_resource()
         self.wake_up_engine_actor()
         kwargs = dict(
             model=self.model_name,
@@ -615,29 +705,30 @@ class MicroBatchScheduler(ChatCompletionScheduler):
             kwargs["top_p"] = self.config.val_kwargs.top_p
             kwargs["temperature"] = self.config.val_kwargs.temperature
 
-        print(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
-
         # NOTE: For multi-turn rollout, repeat raw_prompt n times and process each prompt independently,
         # validation dataset has already been repeated in `PPOTrainer._validate`.
         n = 1 if batch.meta_info.get("validate", False) else self.config.n
-        batch_conversations = [None] * len(batch) * n
+        print(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
             # raw_prompt: [{"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
-            batch_conversations[batch_index] = conversation.tolist()
-
             self.global_data_queue.put_nowait(
                 RolloutReq(
+                    raw_prompt=conversation,
                     messages=conversation.tolist(),
                     model_name=self.model_name,
                     sampling_params=kwargs,
                     tools_schema=self.completion_callback.tool_schemas,
                     extra_body=self.completion_callback.extra_body,
                     verl_session_id=uuid4().hex,
+                    sample_id=batch_index // n,
                 )
             )
         print("[MicroBatchChatCompletionScheduler] generate_sequences start, with len(batch): ", len(batch))
-        batch_conversations = await self.reduce_handler(self._get_rollout_batch_size(len(batch)))
+        batch_conversations = await self.reduce_handler(self._get_rollout_batch_size(len(batch)), n_sample=n, format=self.reduce_format)
         print(f"partial rollout done, cancel all left request, real size: {len(batch_conversations)}")
         await self.cancel_all_req()
         print("[MicroBatchChatCompletionScheduler] generate_sequences done")
-        return self.completion_callback.postprocess(batch, batch_conversations, n=n)
+        if self.reduce_format == "ReduceResp":
+            return self.completion_callback.new_postprocess(batch_conversations, n=n)
+        else:
+            return self.completion_callback.postprocess(batch, batch_conversations, n=n)

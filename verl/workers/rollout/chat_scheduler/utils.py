@@ -155,6 +155,12 @@ class ActorMeta:
     local_id: int
 
 
+@dataclass
+class DeathLetter:
+    actor_meta: ActorMeta
+    async_task: asyncio.Task
+
+
 class WorkFunc(Protocol):
     @abstractmethod
     async def __call__(self, meta: ActorMeta, message: Message) -> None:
@@ -162,12 +168,13 @@ class WorkFunc(Protocol):
 
 
 class WorkStealingActor:
-    def __init__(self, worker_id: int, local_id: int, local_queues: QueueGroup, global_queue: asyncio.Queue, work_fn: WorkFunc, enable_work_stealing: bool = True):
+    def __init__(self, worker_id: int, local_id: int, local_queues: QueueGroup, global_queue: asyncio.Queue, work_fn: WorkFunc, enable_work_stealing: bool = True, death_letter: asyncio.Queue = None):
         self.worker_id = worker_id
         self.local_id = local_id
         self.local_queues = local_queues
         self.global_queue = global_queue
         self.func = work_fn
+        self.death_letter = death_letter
         self.total_workers = len(local_queues)
         self.actor_meta = ActorMeta(worker_id, self.local_queues, self.local_id)
         self.enable_work_stealing = enable_work_stealing
@@ -188,7 +195,7 @@ class WorkStealingActor:
             return base_queue
 
     async def run(self):
-        logger.info("start worker for actor, actor_meta: ", self.actor_meta)
+        logger.info(f"start worker for actor, actor_meta: {self.actor_meta}")
         while not self.shutdown_flag:
             try:
                 task = await self.get_task()
@@ -209,12 +216,26 @@ class WorkStealingActor:
         logger.info(f"shutdown done with actor meta: {self.actor_meta}")
 
     def _init_actor_coro(self):
-        self.coro = asyncio.create_task(self.run())
+        if self.death_letter is not None:
+
+            def callback(task):
+                if task.exception() is not None:
+                    letter = DeathLetter(
+                        actor_meta=self.actor_meta,
+                        async_task=task,
+                    )
+                    self.death_letter.put_nowait(letter)
+
+            self.coro = asyncio.create_task(self.run())
+            self.coro.add_done_callback(callback)
+        else:
+            self.coro = asyncio.create_task(self.run())
 
     def cancel_task(self):
         evt = asyncio.Event()
         if self.cur_task is not None and (self.cur_task.done() or self.cur_task.cancelled()):
             self.cur_task.add_done_callback(functools.partial(self._set_evt, evt=evt))
+            print(self.cur_task.print_stack())
             self.cur_task.cancel()
         else:
             evt.set()

@@ -161,12 +161,12 @@ class AsyncLLMServerManager:
         self.chat_scheduler_thread.start()
         self.chat_scheduler_ready.wait()
 
-    def _init_chat_scheduler(self, chat_scheduler_cls):
+    def _init_chat_scheduler(self):
         self.chat_scheduler_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.chat_scheduler_loop)
 
         _chat_scheduler_cls = chat_scheduler_class(
-            scheduler_str=self.config.chat_scheduler.name,
+            scheduler_str=self.config.rollout.chat_scheduler.name,
         )
         self.chat_scheduler = _chat_scheduler_cls(
             config=self.full_config,
