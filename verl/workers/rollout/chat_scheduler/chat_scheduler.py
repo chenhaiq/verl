@@ -19,6 +19,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -468,6 +469,7 @@ class ChatCompletionScheduler:
         return await chat_completions_aiohttp(address, **chat_complete_request)
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
+        t_start = time.time()
         kwargs = dict(
             model=self.model_name,
             temperature=self.config.temperature,
@@ -500,9 +502,10 @@ class ChatCompletionScheduler:
             )
 
         await asyncio.gather(*tasks)
+        output_batch = self.completion_callback.postprocess(batch, batch_conversations, n=n)
+        output_batch.meta_info["timing"] = {"generate_sequences": time.time() - t_start}
         print("[ChatCompletionScheduler] generate_sequences done")
-
-        return self.completion_callback.postprocess(batch, batch_conversations, n=n)
+        return output_batch
 
     async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any], address: str = None):
         done = asyncio.Event()
@@ -527,7 +530,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         self._validate_callback()
         self.max_inflight_req = self.mirco_batch_config.micro_batch.max_inflight_req if self.mirco_batch_config.micro_batch.max_inflight_req else max_inflight_req
         self.server_addresses = server_addresses
-        self.enable_work_stealing = self.mirco_batch_config.micro_batch.enable_work_stealing if self.mirco_batch_config.micro_batch.enable_work_stealing else enable_work_stealing
+        self.enable_work_stealing = self.mirco_batch_config.micro_batch.enable_work_stealing if self.mirco_batch_config.micro_batch.enable_work_stealing is not None else enable_work_stealing
         self.number_of_servers = len(server_addresses)
         self.rollout_rate = rollout_rate
         self.rollout_req_handler = rollout_req_handler if rollout_req_handler else self.default_handle_rollout_req
@@ -692,6 +695,7 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         pass
 
     async def generate_sequences(self, batch: DataProto, **sampling_params) -> DataProto:
+        t_start = time.time()
         self._lazy_init_global_resource()
         self.wake_up_engine_actor()
         kwargs = dict(
@@ -727,8 +731,13 @@ class MicroBatchScheduler(ChatCompletionScheduler):
         batch_conversations = await self.reduce_handler(self._get_rollout_batch_size(len(batch)), n_sample=n, format=self.reduce_format)
         print(f"partial rollout done, cancel all left request, real size: {len(batch_conversations)}")
         await self.cancel_all_req()
+
         print("[MicroBatchChatCompletionScheduler] generate_sequences done")
+
         if self.reduce_format == "ReduceResp":
-            return self.completion_callback.new_postprocess(batch_conversations, n=n)
+            output_batch = self.completion_callback.new_postprocess(batch_conversations, n=n)
         else:
-            return self.completion_callback.postprocess(batch, batch_conversations, n=n)
+            output_batch = self.completion_callback.postprocess(batch, batch_conversations, n=n)
+        output_batch.meta_info["timing"] = {"generate_sequences": time.time() - t_start}
+
+        return output_batch
