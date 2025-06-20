@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import pickle
+import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Union
 
@@ -34,7 +35,7 @@ from packaging import version
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.py_functional import union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
 
@@ -96,6 +97,7 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
 
 
 def unpad_dataproto(data: "DataProto", pad_size):
+    """Unpad the data proto with pad_size. i.e. `data[:-pad_size]`"""
     if pad_size != 0:
         data = data[:-pad_size]
     return data
@@ -290,11 +292,11 @@ class DataProto:
 
     def print_size(self, prefix=""):
         size_of_tensordict = 0
-        if self.batch is None:
-            for key, tensor in self.batch.items():
+        if self.batch is not None:
+            for _, tensor in self.batch.items():
                 size_of_tensordict += tensor.element_size() * tensor.numel()
         size_of_numpy_array = 0
-        for key, numpy_array in self.non_tensor_batch.items():
+        for _, numpy_array in self.non_tensor_batch.items():
             size_of_numpy_array += numpy_array.nbytes
 
         size_of_numpy_array /= 1024**3
@@ -512,6 +514,32 @@ class DataProto:
 
         # Return a new DataProto object
         return type(self)(batch=sliced_batch, non_tensor_batch=sliced_non_tensor, meta_info=self.meta_info)
+
+    def join(self, other: "DataProto") -> "DataProto":
+        """
+        Join another DataProto to the current one.
+
+        Args:
+            other (DataProto): The DataProto to join.
+
+        Returns:
+            None
+        """
+        if not isinstance(other, DataProto):
+            raise TypeError(f"Can only join with another DataProto, but got {type(other)}")
+
+        # Join batch
+        if self.batch is not None and other.batch is not None:
+            self.batch = torch.cat([self.batch, other.batch], dim=0)
+        elif other.batch is not None:
+            self.batch = other.batch
+
+        # Join non_tensor_batch
+        for key, val in other.non_tensor_batch.items():
+            if key in self.non_tensor_batch:
+                self.non_tensor_batch[key] = np.concatenate([self.non_tensor_batch[key], val], axis=0)
+            else:
+                self.non_tensor_batch[key] = val
 
     def pop(self, batch_keys=None, non_tensor_batch_keys=None, meta_info_keys=None) -> "DataProto":
         """Pop a subset of the DataProto via `batch_keys` and `meta_info_keys`
@@ -839,6 +867,149 @@ class DataProto:
 
 
 @dataclass
+class LinkedDataProto(DataProto):
+    """
+    Represents a data structure that behaves like a linked list.
+    Loads dataset on demand from DataLoader.
+    Elements can be accessed via `next()` method.
+    """
+
+    dataloader: Optional[DataLoader] = None
+    _current_index: int = -1  # Index of the current element in _data_cache, -1 if before the first element
+    _dataloader_iter: Optional[object] = None
+    _dataloader_exhausted: bool = False
+    _linked_len: int = -1  # dataload len, -1 for unknown
+    _next: Optional["LinkedDataProto"] = None
+
+    def __post_init__(self):
+        logging.info(f"Using DataProto: {type(self)}")
+        if self.dataloader is not None:
+            self._linked_len = len(self.dataloader)
+            self._dataloader_iter = iter(self.dataloader)
+            self._dataloader_exhausted = False
+        else:
+            # If no dataloader, behave like a regular DataProto
+            super().__post_init__()  # Call parent's post_init for consistency checks
+            self._dataloader_exhausted = True  # No data to load
+
+    def next(self) -> "DataProto":
+        """Moves to and returns the next element. Loads from dataloader if not cached."""
+        if self._next:
+            return self._next
+
+        if self.dataloader is None:
+            # No dataloader, behave like a regular DataProto
+            return None
+
+        next_idx = self._current_index + 1
+        if (self._linked_len != -1 and next_idx >= self._linked_len) or self._dataloader_exhausted:
+            self._dataloader_exhausted = True
+            logging.info("No more data in DataLoader configured for LinkedDataProto.")
+            return None
+
+        try:
+            batch_dict = next(self._dataloader_iter)
+            loaded_batch = type(self).from_single_dict(batch_dict)
+            loaded_batch.dataloader = self.dataloader
+            loaded_batch._linked_len = self._linked_len
+            loaded_batch._dataloader_iter = self._dataloader_iter
+            loaded_batch._current_index = next_idx
+            loaded_batch._dataloader_exhausted = self._dataloader_exhausted
+
+            self._next = loaded_batch
+
+            return loaded_batch
+        except StopIteration:
+            self._dataloader_exhausted = True
+            self._next = None
+            logging.info("No next item in DataLoader")
+            return None
+        except Exception as e:
+            logging.error(f"Error loading next item from DataLoader: {e}")
+            traceback.print_exc()
+            return None
+
+    def prefetch_samples(self, count=1) -> "DataProto":
+        return self
+
+    def postpone_samples(self, samples: "DataProto"):
+        return False
+
+    def should_stop_gen():
+        return False
+
+
+class SequentialPrefetchOnPolicyDataProto(LinkedDataProto):
+    """
+    1. prefetch samples from next batch
+    2. do not postpone sample in order to on-policy
+    """
+
+    def prefetch_samples(self, count=1) -> "DataProto":
+        if count > len(self):
+            raise ValueError(f"count {count} must be less than batch_size {len(self)}")
+
+        if count > len(self):
+            raise ValueError(f"count {count} must be less than batch_size {len(self)}")
+
+        next_batch = self.next()
+        # 1. Get the prefetched samples
+        prefetched_data = next_batch.slice(0, count, 1)
+
+        # 2. Remove the prefetched samples from the current batch
+        remaining_data = next_batch.slice(count, len(self), 1)
+
+        # 3. Update the current instance with the remaining data
+        next_batch.batch = remaining_data.batch
+        next_batch.non_tensor_batch = remaining_data.non_tensor_batch
+
+        # 4. join fetched data to self
+        self.join(prefetched_data)
+
+        return prefetched_data
+
+
+class SequentialPrefetchPostponeOffPolicyDataProto(LinkedDataProto):
+    """
+    1. prefetch samples from next batch
+    2. postpone sample to next batch (off-policy)
+    3. stop current batch when the original samples are generated
+    """
+
+    def postpone_samples(self, samples: "DataProto") -> bool:
+        next_batch = self.next()
+        next_batch.join(samples)
+
+        indices_to_remove = samples.non_tensor_batch["index"]
+
+        # Create a boolean mask for elements to keep
+        mask = ~np.isin(self.non_tensor_batch["index"], indices_to_remove)
+
+        # Apply the mask to non_tensor_batch
+        for key, val in self.non_tensor_batch.items():
+            self.non_tensor_batch[key] = val[mask]
+
+        # Apply the mask to batch
+        if self.batch is not None:
+            self.batch = self.batch[torch.from_numpy(mask)]
+
+        return True
+
+
+def get_data_proto(rollout_policy: str, dataloader: DataLoader) -> LinkedDataProto:
+    """
+    factory method to create LinkedDataProto that can be subclassed
+    to extend with different prefetch/postpone/stop_generate policy
+    """
+    if rollout_policy == "SequentialPrefetchOnPolicyDataProto":
+        return SequentialPrefetchOnPolicyDataProto(dataloader=dataloader)
+    elif rollout_policy == "SequentialPrefetchPostponeOffPolicyDataProto":
+        return SequentialPrefetchPostponeOffPolicyDataProto(dataloader=dataloader)
+    else:
+        return LinkedDataProto(dataloader=dataloader)
+
+
+@dataclass
 class DataProtoFuture:
     """
     DataProtoFuture aims to eliminate actual data fetching on driver. By doing so, the driver doesn't have to wait
@@ -889,7 +1060,7 @@ def all_gather_data_proto(data: DataProto, process_group):
     group_size = torch.distributed.get_world_size(group=process_group)
     assert isinstance(data, DataProto)
     prev_device = data.batch.device
-    data.batch = data.batch.to(get_torch_device().current_device())
+    data.batch = data.batch.to(get_device_id())
     data.batch = allgather_dict_tensors(data.batch.contiguous(), size=group_size, group=process_group, dim=0)
     data.batch = data.batch.to(prev_device)
     # all gather non_tensor_batch

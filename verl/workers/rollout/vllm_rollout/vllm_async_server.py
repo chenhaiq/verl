@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
@@ -155,6 +156,7 @@ class AsyncvLLMServer(AsyncServerBase):
         kwargs = dict(
             n=1,
             logprobs=0,
+            repetition_penalty=1.0,
             max_new_tokens=config.response_length,
         )
         for k in config.keys():
@@ -168,12 +170,11 @@ class AsyncvLLMServer(AsyncServerBase):
             disable_log_requests=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend=ExternalRayDistributedExecutor,
+            distributed_executor_backend=ExternalRayDistributedExecutor if os.environ.get("VERL_VLLM_USE_RAY_BACKEND", "1") == "1" else None,
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
