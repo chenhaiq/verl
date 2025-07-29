@@ -27,7 +27,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
+from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -385,7 +385,6 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
-
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -431,7 +430,9 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                     )
-
+                    entropy_loss = None
+                    kl_loss = None
+                    ref_log_prob = None
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -468,9 +469,32 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
+                    del (
+                        model_inputs,
+                        log_prob,
+                        entropy,
+                        policy_loss,
+                        loss,
+                        entropy_loss,
+                        kl_loss,
+                        pg_loss,
+                        pg_clipfrac,
+                        ppo_kl,
+                        pg_clipfrac_lower,
+                        response_mask,
+                        old_log_prob,
+                        advantages,
+                        ref_log_prob,
+                    )
+                    mem_free, mem_total = get_torch_device().mem_get_info()
+                    if mem_free / mem_total < 0.1:
+                        logger.info(f"free memory: {mem_free / mem_total} is less than 10%, empty cache")
+                        torch.cuda.empty_cache()
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                del grad_norm, micro_batches
+
         self.actor_optimizer.zero_grad()
         return metrics
