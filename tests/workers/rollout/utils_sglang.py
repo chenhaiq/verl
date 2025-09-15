@@ -16,7 +16,7 @@ from datetime import timedelta
 
 import torch
 from omegaconf import OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import pad_sequence_to_length
@@ -88,34 +88,39 @@ def clean_torchelastic_env():
 def load_tokenizer_and_model(local_model_path, dtype="bfloat16"):
     tokenizer = AutoTokenizer.from_pretrained(local_model_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(local_model_path, torch_dtype=getattr(torch, dtype), device_map="cuda")
+    model = AutoModelForCausalLM.from_pretrained(
+        local_model_path, torch_dtype=getattr(torch, dtype), device_map="cuda", attn_implementation="flash_attention_2"
+    )
     return tokenizer, model
 
 
 def prepare_inputs(tokenizer, prompts, max_prompt_length):
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     tokenized = tokenizer(prompts, return_tensors="pt", padding=True)
+    print(f"prompt length: {tokenized['input_ids'].shape}, max_prompt_length: {max_prompt_length}")
     input_ids = pad_sequence_to_length(tokenized["input_ids"], max_prompt_length, pad_token_id, left_pad=True)
     attention_mask = pad_sequence_to_length(
         tokenized["attention_mask"], max_prompt_length, pad_token_id=0, left_pad=True
     )
     position_ids = compute_position_id_with_mask(attention_mask)
     position_ids = pad_sequence_to_length(position_ids, max_prompt_length, pad_token_id=0, left_pad=True)
+    print(f"return input_ids: {input_ids.shape}")
     return input_ids, attention_mask, position_ids
 
 
 def generate_hf_output(model, input_ids, attention_mask, tokenizer, max_response_length):
-    generation_config = GenerationConfig(do_sample=False)
     output = model.generate(
         input_ids=input_ids.cuda(),
         attention_mask=attention_mask.cuda(),
         max_new_tokens=max_response_length,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
-        generation_config=generation_config,
+        temperature=0,
+        do_sample=False,
         output_scores=False,
         return_dict_in_generate=True,
         use_cache=False,
+        num_return_sequences=1,
     )
     seq = output.sequences
     response = seq[:, input_ids.shape[1] :]
