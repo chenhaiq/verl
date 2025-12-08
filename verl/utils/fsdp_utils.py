@@ -93,9 +93,12 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         return None
 
     default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
+    print(f"default_transformer_cls_names_to_wrap: {default_transformer_cls_names_to_wrap}")
     fsdp_transformer_layer_cls_to_wrap = _get_attr(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
     )
+    print(f"fsdp_transformer_layer_cls_to_wrap: {fsdp_transformer_layer_cls_to_wrap} from config {config}")
+
     min_num_params = _get_attr("min_num_params", 0)
     auto_wrap_policy = None
 
@@ -121,7 +124,9 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        print_module(module)
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
+            print(f"layer_class to get_module_class_from_name: {layer_class}")
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
                 raise Exception("Could not find the transformer layer class to wrap in the model.")
@@ -138,6 +143,25 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         auto_wrap_policy = functools.partial(_or_policy, policies=policies)
 
     return auto_wrap_policy
+
+
+def print_module(module):
+    """
+    Gets a class from a module by its name.
+
+    Args:
+        module (`torch.nn.Module`): The module to get the class from.
+        name (`str`): The name of the class.
+    """
+    modules_children = list(module.children())
+    print(f"print_module: module name: {module.__class__.__name__} children: {len(modules_children)}")
+    if len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = print_module(child_module)
+            if module_class is not None:
+                return module_class
 
 
 @torch.no_grad()

@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 
@@ -26,25 +27,108 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._unshard_param_utils import _get_module_fsdp_state, _unshard_params_for_summon
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+from torch.distributed.fsdp.wrap import (
+    _module_wrap_policy,
+    transformer_auto_wrap_policy,
+)
+from transformers.trainer_pt_utils import get_module_class_from_name
 
+from recipe.vla.models.vla_models import get_vla_model_and_config, get_vla_processor
 from verl import DataProto
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.flops_counter import FlopsCounter
-from verl.utils.fsdp_utils import fsdp_version
+from verl.utils.fsdp_utils import fsdp_version, init_fn
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
-from verl.workers.config import HFModelConfig
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.config.optimizer import build_optimizer
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def get_vla_fsdp_wrap_policy(module):
+    """
+    FSDP wrap policy for VLA models.
+
+    Args:
+        module: The model to wrap
+
+    Returns:
+        FSDP auto wrap policy function
+    """
+
+    # Get transformer layer classes to wrap
+    if hasattr(module, "language_model"):
+        # For VLA models, get transformer classes from language_model submodule
+        fsdp_transformer_layer_cls_to_wrap = getattr(module.language_model, "_no_split_modules", None)
+    else:
+        # For standard models, get transformer classes directly from module
+        fsdp_transformer_layer_cls_to_wrap = getattr(module, "_no_split_modules", None)
+
+    # Build policies list
+    policies = []
+
+    # Add vision transformer policies for VLA models
+    try:
+        from timm.models.vision_transformer import VisionTransformer
+
+        # Vision transformer policies
+        vit_wrap_policy = functools.partial(_module_wrap_policy, module_classes={VisionTransformer})
+        policies.append(vit_wrap_policy)
+    except ImportError:
+        pass
+
+    # Prismatic projector policy for VLA models
+    # The prismatic package initializes a DistributedOverwatch by default,
+    # which initializes accelerate.PartialState, which in turn
+    # initializes a torch.distributed process group in gloo.
+    # This results in default group being gloo, which does not support CUDA tensors and allreduce average.
+    # To fix this, we set the default group to cuda.
+    try:
+        from prismatic.extern.hf.modeling_prismatic import PrismaticProjector
+
+        prismatic_fsdp_wrapping_policy = functools.partial(
+            _module_wrap_policy,
+            module_classes={PrismaticProjector},
+        )
+        policies.append(prismatic_fsdp_wrapping_policy)
+    except ImportError:
+        pass
+
+    # Add transformer layer policies
+    if fsdp_transformer_layer_cls_to_wrap is not None:
+        transformer_cls_to_wrap = set()
+        for layer_class in fsdp_transformer_layer_cls_to_wrap:
+            transformer_cls = get_module_class_from_name(module, layer_class)
+            if transformer_cls is None:
+                raise Exception("Could not find the transformer layer class to wrap in the model.")
+            else:
+                transformer_cls_to_wrap.add(transformer_cls)
+
+        llm_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            # Transformer layer class to wrap
+            transformer_layer_cls=transformer_cls_to_wrap,
+        )
+        policies.append(llm_wrap_policy)
+
+    # Return appropriate policy based on number of policies
+    if len(policies) == 0:
+        return None
+    elif len(policies) == 1:
+        return policies[0]
+    else:
+        # Multiple policies - combine with _or_policy
+        from torch.distributed.fsdp.wrap import _or_policy
+
+        return functools.partial(_or_policy, policies=policies)
 
 
 class RobActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -90,8 +174,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         self.rollout = NaiveRolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
 
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
-        self.model_config = model_config
+        self.model_config = self.actor_model_config
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_rollout(self):
@@ -201,16 +284,8 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         from omegaconf import OmegaConf
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
-        from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+        self.processor = get_vla_processor(self.config.model.path)
 
-        from recipe.vla.models.openvla_oft.configuration_prismatic import OpenVLAConfig
-        from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
-        from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
@@ -254,3 +329,140 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
             )
 
         torch.distributed.barrier()
+
+    def _build_model_optimizer(
+        self,
+        model_path,
+        fsdp_config,
+        optim_config,
+        override_model_config,
+        use_remove_padding=False,
+        use_fused_kernels=False,
+        enable_gradient_checkpointing=False,
+        trust_remote_code=False,
+        use_liger=False,
+        role="actor",
+        enable_activation_offload=False,
+    ):
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision
+
+        from verl.utils.model import print_model_size
+        from verl.utils.torch_dtypes import PrecisionType
+
+        assert role in ["actor", "ref"]
+
+        log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
+        local_path = model_path
+
+        # # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        # # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+        # self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+
+        torch_dtype = fsdp_config.get("model_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        actor_module, actor_model_config = get_vla_model_and_config(
+            local_path, trust_remote_code, override_model_config
+        )
+
+        # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+        actor_module.to(torch_dtype)
+
+        torch.distributed.barrier()
+
+        if self.rank == 0:
+            print_model_size(actor_module)
+
+        log_gpu_memory_usage(f"After init {role} from HF AutoModel", logger=logger)
+
+        # We wrap FSDP for rollout as well
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = PrecisionType.to_dtype(fsdp_config.dtype)
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+        auto_wrap_policy = get_vla_fsdp_wrap_policy(module=actor_module)
+
+        if self.rank == 0:
+            print(f"wrap_policy: {auto_wrap_policy}")
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        # TODO: add transformer policy
+        # We force reference policy to use CPUOffload to save memory.
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        fsdp_strategy = self.config.actor.strategy
+        if fsdp_strategy == "fsdp":
+            actor_module_fsdp = FSDP(
+                actor_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,  # zero3
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                use_orig_params=self.use_orig_params,
+                forward_prefetch=fsdp_config.get("forward_prefetch", False),
+            )
+        else:
+            raise NotImplementedError(f"not implement {fsdp_strategy}")
+
+        # if enable_activation_offload:
+        #     enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
+
+        log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
+
+        # TODO: add more optimizer args into config
+        if role == "actor" and optim_config is not None:
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+
+            total_steps = optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            if self.rank == 0:
+                print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
+
+            if lr_scheduler_type == "constant":
+                actor_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                actor_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
+
+            log_gpu_memory_usage(f"After {role} optimizer init", logger=logger)
+        else:
+            actor_optimizer = None
+            actor_lr_scheduler = None
+
+        return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config

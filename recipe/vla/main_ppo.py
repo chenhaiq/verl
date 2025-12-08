@@ -65,18 +65,16 @@ def main_task(config):
 
     from omegaconf import OmegaConf
 
-    from verl.utils.fs import copy_local_path_from_hdfs
-
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 
     # download the checkpoint from hdfs
-    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+    # local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
 
     # instantiate tokenizer
-    from verl.utils import hf_tokenizer
 
-    tokenizer = hf_tokenizer(local_path)
+    # tokenizer = hf_tokenizer(local_path)
+    tokenizer = None
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:

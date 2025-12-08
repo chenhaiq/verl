@@ -20,18 +20,14 @@ The output will contain
 4. log_probs
 """
 
-import json
 import logging
-import os
 
 import torch
 from PIL import Image
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.utils.rnn import pad_sequence
 
 from recipe.vla.envs.action_utils import center_crop_image, resize_image
-from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
-from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticProcessor
+from recipe.vla.models.vla_models import get_vla_model_and_config, get_vla_processor
 from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.workers.rollout.base import BaseRollout
@@ -119,18 +115,13 @@ class NaiveRolloutRob(BaseRollout):
         if module is not None:
             self.module = module
         else:
-            self.module = OpenVLAForActionPrediction.from_pretrained(model_config["path"], trust_remote_code=True)
-        self.module.vision_backbone.set_num_images_in_input(1)
-        self.processor = PrismaticProcessor.from_pretrained(model_config["path"], trust_remote_code=True)
-        dataset_statistics_path = os.path.join(model_config["path"], "dataset_statistics.json")
-        if os.path.isfile(dataset_statistics_path):
-            with open(dataset_statistics_path) as f:
-                norm_stats = json.load(f)
-            if isinstance(self.module, FSDP):
-                self.module.module.norm_stats = norm_stats
-            else:
-                self.module.norm_stats = norm_stats
-        self.module.eval()
+            self.module, _ = get_vla_model_and_config(
+                model_config["path"], trust_remote_code=True, override_model_config={}
+            )
+        self.processor = get_vla_processor(model_config["path"])
+
+    def get_model(self):
+        return self.module
 
     @torch.no_grad()
     def _generate_one_step(self, prompts: dict, do_sample, temperature, max_prompt_length):

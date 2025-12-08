@@ -8,7 +8,8 @@ test_files=$libero_test_path
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/Openvla-oft-SFT-libero10-trajall"}
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/file_system/common-models/openpi/openpi-assets/checkpoints/pi05_libero_torch"}
+# SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/file_system/common-models/Haozhan72-kangsheng/Openvla-oft-SFT-libero10-trajall"}
 
 NUM_NODES=1
 NUM_GPUS=8
@@ -18,7 +19,7 @@ ROLLOUT_N=8
 # isaac or libero
 # libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
-SIM_TYPE=${SIM_TYPE:-"isaac"}
+SIM_TYPE=${SIM_TYPE:-"libero"}
 PROJECT_NAME="vla_libero_RL"
 EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus"
 
@@ -32,11 +33,6 @@ fi
 mkdir /root/LIBERO/libero/libero/../datasets
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n 1)
 
-# force osmesa in Hopper
-if echo "$gpu_name" | grep "NVIDIA H"; then
-    echo "enable MUJOCO_GL=osmesa in Hopper"
-    export MUJOCO_GL=osmesa
-fi
 
 
 $PYTHON -m recipe.vla.main_ppo \
